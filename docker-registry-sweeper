@@ -661,7 +661,7 @@ class Registry(object):
 
                 # add ancestor nodes
                 LOG.debug("Adding image: %s", image)
-                self.graph.add_node(image, tags=[], repos=[], ref=0)
+                self.graph.add_node(image, tags=[], repos=[], marked=False)
                 self.graph.add_path(ancestry)
 
                 # output progress
@@ -738,13 +738,16 @@ class Registry(object):
 
                     # do depth first search marking successor nodes
                     for n in networkx.algorithms.dfs_preorder_nodes(self.graph, image):
-                        LOG.debug("Marking: %s (%s/%s)", n, repository, tag)
 
-                        # mark node
-                        self.graph.node[n]['ref'] += 1
+                        if not self.graph.node[n]['marked']:
 
-                        # increment counter
-                        counters['marked'] += 1
+                            LOG.debug("Marking: %s (%s/%s)", n, repository, tag)
+
+                            # mark node
+                            self.graph.node[n]['marked'] = True
+
+                            # increment counter
+                            counters['marked'] += 1
 
                 # output progress
                 counters['repositories'] += 1
@@ -799,7 +802,6 @@ class Registry(object):
 
             image_date = from_iso8601(info['created'])
             image_tags = self.graph.node[n]['tags']
-            image_ref = self.graph.node[n]['ref']
 
             image_size = 0
             if 'Size' in info:
@@ -813,7 +815,6 @@ class Registry(object):
             history.append(collections.OrderedDict(id=n,
                                                    command=image_cmd,
                                                    size=image_size,
-                                                   ref=image_ref,
                                                    tags=image_tags,
                                                    created=to_iso8601(image_date)))
 
@@ -845,10 +846,10 @@ class Registry(object):
 
         # traverse the graph to find unreferenced images
         unreferenced = set()
-        for n, data in self.graph.nodes_iter(True):
-            if data['ref'] < 1:
+        for n, node_data in self.graph.nodes_iter(True):
+            if not node_data['marked']:
                 unreferenced.add(n)
-                LOG.debug("Unreferenced image: %s (ref=%d)", n, data['ref'])
+                LOG.debug("Unreferenced image: %s", n)
 
             # output progress
             counter += 1
