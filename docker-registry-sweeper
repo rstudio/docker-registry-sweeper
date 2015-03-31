@@ -9,13 +9,14 @@ Usage:
   docker-registry-sweeper --version
 
 Options:
-  -c --config=FILE      Path to configuration file. [default: conf/docker-registry-sweeper.conf]
-  -g --graph=FILE       Load the graph from FILE.
-  -S --save=FILE        Save the graph to FILE (warning: this will overwrite).
-  -a --age=AGE          Only remove images that have been unreferenced for at least AGE. [default: 1d]
-  -h --help             Show this help.
-  -V --version          Show version.
-  -v --verbose          Enable verbose output.
+  -c --config=FILE          Path to configuration file. [default: conf/docker-registry-sweeper.conf]
+  -g --graph=FILE           Load the graph from FILE.
+  -F --graph-format=FMT     Graph file format (pickle or json) [default: json]
+  -S --save=FILE            Save the graph to FILE (warning: this will overwrite).
+  -a --age=AGE              Only remove images that have been unreferenced for at least AGE. [default: 1d]
+  -h --help                 Show this help.
+  -V --version              Show version.
+  -v --verbose              Enable verbose output.
 
 """
 import functools
@@ -37,6 +38,7 @@ from xml.etree import cElementTree as etree
 
 import networkx
 import networkx.algorithms
+import networkx.readwrite.gpickle
 import networkx.readwrite.json_graph
 import toro
 import tornado.options
@@ -476,7 +478,7 @@ class S3RegistryDriver(object):
                     # extract image id
                     image = p[len(prefix):-1]
 
-                    # check if image was seen
+                    # since we're listing the bucket, duplicate prefixes may be returned
                     if image not in images:
                         images.add(image)
 
@@ -513,6 +515,7 @@ class S3RegistryDriver(object):
                     # extract repo name
                     repo = p[len(prefix):-1]
 
+                    # since we're listing the bucket, duplicate prefixes may be returned
                     if repo not in repositories:
                         repositories.add(repo)
 
@@ -584,14 +587,19 @@ class Registry(object):
         self.driver = driver
         self.graph = None
 
-    def _read_graph(self, path):
+    def _read_graph(self, path, format='pickle'):
         LOG.debug("Reading graph...")
         with open(path, 'rb') as f:
-            graph = networkx.readwrite.json_graph.node_link_graph(json.load(f, 'utf-8'), directed=True)
+            if format == 'pickle':
+                graph = networkx.readwrite.gpickle.read_gpickle(path)
+            elif format == 'json':
+                graph = networkx.readwrite.json_graph.node_link_graph(json.load(f, 'utf-8'), directed=True)
+            else:
+                raise RuntimeError("Unsupported graph format: %s" % format)
         LOG.debug("Done!")
         return graph
 
-    def _write_graph(self, path, overwrite=False):
+    def _write_graph(self, path, format='pickle', overwrite=False):
         LOG.debug("Writing graph...")
         if os.path.exists(path):
             if not overwrite:
@@ -599,15 +607,18 @@ class Registry(object):
             else:
                 LOG.warn("Overwriting file: %s", path)
         with open(path, 'wb') as f:
-            json.dump(networkx.readwrite.json_graph.node_link_data(self.graph), f, indent=4)
+            if format == 'pickle':
+                networkx.readwrite.gpickle.write_gpickle(self.graph, path)
+            elif format == 'json':
+                json.dump(networkx.readwrite.json_graph.node_link_data(self.graph), f, indent=4)
         LOG.debug("Done!")
 
-    def load(self, path):
-        LOG.info("Loading graph from: %s", path)
-        self.graph = self._read_graph(path)
+    def load(self, path, format='pickle'):
+        LOG.debug("Loading graph from: %s", path)
+        self.graph = self._read_graph(path, format)
 
     @coroutine
-    def scan(self, save=None):
+    def scan(self, save=None, save_format='pickle'):
         """
         Construct the registry graph by scanning
         :return:
@@ -623,14 +634,14 @@ class Registry(object):
         yield self._scan_images()
 
         # save graph
-        self._write_graph('temp.json', True)
+        self._write_graph('temp.json', 'json', True)
 
         # scan repositories
         yield self._scan_repositories()
 
         # save graph
         if save is not None:
-            self._write_graph(save, True)
+            self._write_graph(save, save_format, True)
 
         LOG.info("Scan completed in %d seconds", (datetime.utcnow() - start_time).total_seconds())
 
@@ -649,15 +660,8 @@ class Registry(object):
             image = yield queue.get()
 
             try:
-                # fetch the images ancestry
-                try:
-                    ancestry = yield self.driver.get_image_ancestry(image)
-                except Exception:
-                    LOG.exception("Failed to fetch image ancestry.")
-
-                    # put item back in the queue
-                    queue.put(image)
-                    return
+                # fetch the image ancestry
+                ancestry = yield self.driver.get_image_ancestry(image)
 
                 # add ancestor nodes
                 LOG.debug("Adding image: %s", image)
@@ -668,6 +672,12 @@ class Registry(object):
                 counters['images'] += 1
                 if counters['images'] > 0 and counters['images'] % 100 == 0:
                     LOG.info("Processing images: complete=%d, queue=%d", counters['images'], queue.qsize())
+
+            except:
+                LOG.exception("Error processing image: %s", image)
+
+                # put item back in the queue
+                queue.put(image)
 
             finally:
                 queue.task_done()
@@ -687,7 +697,7 @@ class Registry(object):
         _process_image_queue()
 
         # fetch and queue images
-        LOG.info("Fetching images...")
+        LOG.debug("Fetching images...")
         yield self.driver.fetch_images(lambda i: queue.put(i))
 
         # wait for queue to be empty
@@ -704,7 +714,7 @@ class Registry(object):
         @coroutine
         def _process_repository():
 
-            # get an item from the queue
+            # get a repo from the queue
             repository = yield queue.get()
 
             try:
@@ -759,10 +769,10 @@ class Registry(object):
                              queue.qsize())
 
             except:
+                LOG.exception("Error processing repository: %s", repository)
 
                 # put item back in the queue
                 queue.put(repository)
-                return
 
             finally:
                 queue.task_done()
@@ -782,7 +792,7 @@ class Registry(object):
         _process_repository_queue()
 
         # fetch and queue repositories for processing
-        LOG.info("Fetching repositories")
+        LOG.debug("Fetching repositories...")
         yield self.driver.fetch_repositories(lambda r: queue.put(r))
 
         # wait for queue to be empty
@@ -801,6 +811,7 @@ class Registry(object):
             info = yield self.driver.get_image_info(n)
 
             image_date = from_iso8601(info['created'])
+            image_repos = self.graph.node[n]['repos']
             image_tags = self.graph.node[n]['tags']
 
             image_size = 0
@@ -816,6 +827,7 @@ class Registry(object):
                                                    command=image_cmd,
                                                    size=image_size,
                                                    tags=image_tags,
+                                                   repos=image_repos,
                                                    created=to_iso8601(image_date)))
 
         raise Return(history)
@@ -874,7 +886,7 @@ class Registry(object):
         to_delete = set()
         for i in set(current_sweep.keys()) & set(last_sweep.keys()):
             # only include images that have expired
-            if datetime.utcnow() - last_sweep[i] > age:
+            if datetime.utcnow() - last_sweep[i] >= age:
                 to_delete.add(i)
             else:
                 LOG.debug("Skipping image: %s (not old enough)", i)
@@ -927,10 +939,11 @@ def main():
     registry = Registry(driver)
     if arguments['--graph']:
         # load graph from file
-        registry.load(arguments['--graph'])
+        registry.load(arguments['--graph'], arguments['--graph-format'])
     else:
         # construct the graph by scanning the registry
-        yield registry.scan(save=arguments['--save'])
+        yield registry.scan(save=arguments['--save'],
+                            save_format=arguments['--graph-format'])
 
     if arguments['sweep']:
 
