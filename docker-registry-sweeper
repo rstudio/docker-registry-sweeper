@@ -1,0 +1,948 @@
+#!/usr/bin/env python
+# coding=utf-8
+"""Docker Registry Sweeper (c) 2015 RStudio Inc.
+
+Usage:
+  docker-registry-sweeper [options] sweep
+  docker-registry-sweeper [options] history <image>
+  docker-registry-sweeper (-h | --help)
+  docker-registry-sweeper --version
+
+Options:
+  -c --config=FILE      Path to configuration file. [default: conf/docker-registry-sweeper.conf]
+  -g --graph=FILE       Load the graph from FILE.
+  -S --save=FILE        Save the graph to FILE (warning: this will overwrite).
+  -a --age=AGE          Only remove images that have been unreferenced for at least AGE. [default: 1d]
+  -h --help             Show this help.
+  -V --version          Show version.
+  -v --verbose          Enable verbose output.
+
+"""
+import functools
+import hashlib
+import hmac
+import json
+import logging
+import logging.config
+import os
+import urllib
+import urlparse
+import collections
+import re
+import yaml
+import docopt
+import dateutil.parser
+from datetime import datetime, timedelta
+from xml.etree import cElementTree as etree
+
+import networkx
+import networkx.algorithms
+import networkx.readwrite.json_graph
+import toro
+import tornado.options
+import tornado.ioloop
+import tornado.log
+import tornado.escape
+import tornado.httpclient
+import tornado.httputil
+
+from tornado.gen import coroutine, Return
+
+
+LOG = logging.getLogger('docker-registry-sweeper')
+
+
+def retry(func=None, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
+    """
+    A decorator for retrying coroutines
+    :param func:
+    :param retries: max number of retries
+    :param delay: delay between retries (in seconds)
+    :param backoff: backoff between retries (in seconds)
+    :param exceptions: exceptions to retry on
+    :return: Future
+    """
+
+    def _wrap(func):
+        @functools.wraps(func)
+        def _wrapped(*args, **kwargs):
+            attempts = 0
+            while True:
+                sleep = delay
+                try:
+                    attempts += 1
+                    result = yield func(*args, **kwargs)
+                except exceptions as ex:
+
+                    # let keyboard interrupts through
+                    if isinstance(ex, KeyboardInterrupt) and ex not in exceptions:
+                        raise ex
+
+                    LOG.error(ex.message)
+                    if attempts <= retries:
+                        LOG.warn("Retrying... (%d)", attempts)
+                        yield tornado.gen.sleep(sleep)
+                        sleep += backoff
+                        continue
+                    else:
+                        raise ex
+                raise Return(result)
+
+        return coroutine(_wrapped)
+
+    if func is not None:
+        # Used like:
+        # @retry
+        return _wrap(func)
+    else:
+        # Used like @retry(whatever=whatever)
+        return _wrap
+
+
+def to_iso8601(when=None, tz=None):
+    """
+    Format a datetime as iso8601
+    :param when: datetime (default to now)
+    :param tz: localize to tz if no tzinfo
+    :return: formatted datetime
+    """
+    if not when:
+        if tz is None:
+            when = datetime.utcnow()
+        else:
+            when = datetime.now(tz)
+    if tz is not None and not when.tzinfo:
+        when = tz.localize(when)
+    _when = when.strftime("%Y-%m-%dT%H:%M:%S.%f%z")
+    return _when
+
+
+def from_iso8601(when, tz=None):
+    """
+    Parse an iso8601 formatted datetime
+    :param when: formatted datetime
+    :param tz: localize to tz if no tzinfo
+    :return: datetime
+    """
+    _when = dateutil.parser.parse(when)
+    if tz is not None and not _when.tzinfo:
+        _when = tz.localize(_when)
+    return _when
+
+
+def parse_timedelta(v):
+    """
+    Parse a timedelta
+    :param v:
+    :return: timedelta
+    >>> parse_timedelta('6m')
+    360
+    >>> parse_timedelta('5s')
+    5
+    >>> parse_timedelta('30')
+    30
+    """
+    def _to_seconds(s):
+        seconds_per_unit = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+        return int(s[:-1]) * seconds_per_unit[s[-1]]
+
+    if re.match('^[0-9]+[s,m,h,d,w]$', v):
+        return timedelta(seconds=_to_seconds(v))
+    else:
+        return timedelta(seconds=int(v))
+
+
+class S3Error(Exception):
+    pass
+
+
+class S3Connection(object):
+    def __init__(self, access_key, secret_key, region='us-east-1'):
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.region = region
+
+
+class S3ListBucketResult(object):
+    def __init__(self):
+        self.name = None
+        self.prefix = None
+        self.marker = None
+        self.max_keys = None
+        self.truncated = None
+        self.prefixes = []
+        self.contents = {}
+        self.next_marker = None
+
+    @classmethod
+    def parse(cls, source):
+
+        result = cls()
+
+        path = []
+        current_parent = None
+        current_key = None
+        current_item = None
+
+        for event, element in etree.iterparse(source, events=("start", "end")):
+
+            # remove namespace from tag (WTF!!?!)
+            tag = element.tag.split('}', 1)[1]
+
+            if event == 'start':
+
+                # get element parent
+                if len(path) > 0:
+                    current_parent = path[-1]
+                else:
+                    current_parent = None
+                path.append(tag)
+
+                if tag == 'Contents':
+                    current_item = dict()
+
+            elif event == 'end':
+
+                if current_parent == 'ListBucketResult':
+                    if tag == 'Name':
+                        result.name = element.text
+                    elif tag == 'Prefix':
+                        result.prefix = element.text
+                    elif tag == 'IsTruncated':
+                        result.truncated = element.text.lower() == 'true'
+                    elif tag == 'NextMarker':
+                        result.next_marker = element.text
+
+                elif current_parent == 'Contents':
+
+                    if tag == 'Key':
+                        current_key = element.text
+                    elif tag == 'Size':
+                        current_item['size'] = int(element.text)
+                    elif tag == 'Etag':
+                        current_item['etag'] = element.text
+                    elif tag == 'Contents':
+                        result.contents[current_key] = current_item
+
+                elif current_parent == 'CommonPrefixes':
+
+                    if tag == 'Prefix':
+                        result.prefixes.append(element.text)
+
+                path.pop()
+
+        return result
+
+
+class S3Client(object):
+    def __init__(self, connection, io_loop=None):
+        """
+        Create new instance of the S3Client class
+        :param connection:
+        :return: None
+        """
+        self._conn = connection
+        self._io_loop = io_loop or tornado.ioloop.IOLoop.current()
+
+        # initialise AsyncHTTPClient
+        tornado.httpclient.AsyncHTTPClient.configure('tornado.curl_httpclient.CurlAsyncHTTPClient', max_clients=100)
+        self._http = tornado.httpclient.AsyncHTTPClient(io_loop=io_loop)
+
+    def _get_authorization(self, url, method, date, headers, hash):
+
+        # gather signed headers
+        signed_headers = self._get_signed_headers(sorted(headers.items()))
+
+        # get canonical date
+        canonical_date = self._get_canonical_date(date)
+
+        # get canonical request
+        canonical_request = self._get_canonical_request(url,
+                                                        method,
+                                                        headers,
+                                                        signed_headers,
+                                                        hash)
+
+        # sign request
+        signature_algorithm = 'AWS4-HMAC-SHA256'
+        signature_scope = self._get_signature_scope(date)
+        signature = self._get_signature(signature_algorithm,
+                                        signature_scope,
+                                        canonical_date,
+                                        canonical_request)
+
+        # get credentials
+        credential = self._conn.access_key + "/" + signature_scope
+
+        return "{} Credential={},SignedHeaders={},Signature={}".format(signature_algorithm,
+                                                                       credential,
+                                                                       signed_headers,
+                                                                       signature)
+
+    def _get_signature(self, signature_algorithm, signature_scope, canonical_date, canonical_request):
+
+        # hash canonical request
+        signature_request = self._calculate_hash(canonical_request)
+
+        # get string to sign
+        string_to_sign = "\n".join([
+            signature_algorithm,
+            canonical_date,
+            signature_scope,
+            signature_request
+        ])
+
+        # sign string
+        return self._calculate_hmac(self._get_signing_key(signature_scope), string_to_sign)
+
+    def _get_signing_key(self, scope):
+        parts = scope.split('/')
+        key = "AWS4" + self._conn.secret_key
+        hash = self._calculate_hmac(key, parts[0], False)
+        hash = self._calculate_hmac(hash, parts[1], False)
+        hash = self._calculate_hmac(hash, parts[2], False)
+        hash = self._calculate_hmac(hash, parts[3], False)
+        return hash
+
+    def _get_signature_scope(self, date):
+        return "/".join((date.strftime("%Y%m%d"), self._conn.region, "s3", "aws4_request"))
+
+    def _get_canonical_date(self, date):
+        return tornado.httputil.format_timestamp(date)
+
+    def _get_canonical_headers_string(self, headers):
+        return "".join([k.lower() + ":" + v.strip() + "\n" for k, v in headers])
+
+    def _get_canonical_query_string(self, query):
+        def _encode(s):
+            return urllib.quote_plus(s.encode('utf-8'))
+
+        return "&".join([_encode(k) + "=" + _encode(v) for k, v in query])
+
+    def _get_signed_headers(self, headers):
+        return ";".join([k.lower() for k, v in headers])
+
+    def _get_canonical_request(self, url, method, headers, signed_headers, hash):
+
+        url_parts = urlparse.urlparse(url)
+
+        query = urlparse.parse_qsl(url_parts.query, True)
+
+        # get canonical verb
+        request_method = method.upper()
+
+        # get canonical url
+        request_uri = url_parts.path
+
+        # get canonical query string
+        request_query = self._get_canonical_query_string(sorted(query))
+
+        # get canonical headers
+        request_headers = self._get_canonical_headers_string(sorted(headers.items()))
+
+        # get signed headers
+        signed_headers = self._get_signed_headers(sorted(headers.items()))
+
+        return "\n".join((request_method,
+                          request_uri,
+                          request_query,
+                          request_headers,
+                          signed_headers,
+                          hash))
+
+    @staticmethod
+    def _calculate_hmac(key, data, hex=True):
+        h = hmac.new(tornado.escape.utf8(key),
+                     tornado.escape.utf8(data),
+                     digestmod=hashlib.sha256)
+        return h.hexdigest() if hex else h.digest()
+
+    @staticmethod
+    def _calculate_hash(data, hex=True):
+        if data is None:
+            data = ""
+        h = hashlib.sha256(data.encode('utf-8'))
+        return h.hexdigest() if hex else h.digest()
+
+    @retry
+    @coroutine
+    def fetch(self, url, method='GET', headers=None, payload=None):
+        # LOG.debug("%s: %s", method, url)
+
+        # get headers
+        if headers is None:
+            headers = dict()
+
+        # get Date
+        date = datetime.utcnow()
+        headers['Date'] = tornado.httputil.format_timestamp(date)
+
+        # get Host
+        host = urlparse.urlparse(url).netloc
+        headers['Host'] = host
+
+        # get Hash
+        hash = self._calculate_hash(payload)
+        headers['x-amz-content-sha256'] = hash
+
+        # get Authorization
+        headers['Authorization'] = self._get_authorization(url, method, date, headers, hash)
+
+        try:
+            response = yield self._http.fetch(url, method=method, headers=headers, body=payload)
+            raise Return(response)
+        except tornado.httpclient.HTTPError as e:
+            self._handle_error(e)
+
+    def _handle_error(self, e):
+        if e.response is not None:
+            if e.response.headers.get('Content-Type') == 'application/xml':
+                if e.response.body:
+                    try:
+                        # parse xml response
+                        doc = etree.fromstring(e.response.body)
+                        message = doc.find('./Message')
+                        if message is not None:
+                            raise S3Error(message.text)
+                    except etree.ParseError as e:
+                        LOG.exception("Error parsing response error.")
+            LOG.warn("Unable to parse response error.")
+        raise e
+
+
+class S3RegistryDriver(object):
+    def __init__(self, bucket, path, connection, secure=True, io_loop=None):
+        """
+        Create a new instance of the S3RegistryDriver class
+        :param path:
+        :param bucket:
+        :param connection:
+        :param secure: If ``True``, use HTTPS, otherwise use HTTP.
+        :param io_loop:
+        :return:
+        """
+
+        self.bucket = bucket
+        self.path = path
+        self.connection = connection
+        self.secure = secure
+        self._io_loop = io_loop or tornado.ioloop.IOLoop.current()
+        self._client = S3Client(self.connection, io_loop=io_loop)
+
+
+    def _get_endpoint(self):
+        if self.connection.region.lower() == 'us-east-1':
+            return "s3-external-1.amazonaws.com"  # use ec2 address
+        else:
+            return "s3-" + self.connection.region + ".amazonaws.com"
+
+    def get_url(self, resource, params=None):
+        scheme = "https" if self.secure else "http"
+        endpoint = self._get_endpoint()
+        url = "{}://{}/{}/{}".format(scheme, endpoint, self.bucket, resource.lstrip("/"))
+        if params is not None:
+            url += '?' + urllib.urlencode(params)
+        return url
+
+    @coroutine
+    def _list_bucket(self, prefix='', delimiter='', marker=None, max_keys=1000):
+        # fetch response
+        response = yield self._client.fetch(self.get_url("/", dict(prefix=prefix,
+                                                                   delimiter=delimiter,
+                                                                   marker=marker or '',
+                                                                   max_keys=max_keys)))
+        # parse response
+        raise Return(S3ListBucketResult.parse(response.buffer))
+
+    @coroutine
+    def fetch_images(self, callback):
+        """
+        Fetch images from the registry and invoke callback for each
+        :param callback:
+        :return:
+        """
+        images = set()
+        prefix = "{}/images/".format(self.path)
+        marker = None
+        while True:
+
+            # list bucket
+            result = yield self._list_bucket(prefix=prefix, delimiter='/', marker=marker)
+
+            # iterate prefixes to get image ids
+            for p in result.prefixes:
+                if p != prefix:
+
+                    # extract image id
+                    image = p[len(prefix):-1]
+
+                    # check if image was seen
+                    if image not in images:
+                        images.add(image)
+
+                        # fire callback
+                        self._io_loop.add_callback(callback, image)
+
+            if not result.truncated:
+                break
+
+            # continue iterating
+            marker = result.next_marker
+
+        LOG.debug("Found: %d images", len(images))
+
+    @coroutine
+    def fetch_repositories(self, callback):
+        """
+        Fetch repositories from registry and invoke callback for each
+        :param callback:
+        :return:
+        """
+        repositories = set()
+        prefix = "{}/repositories/library/".format(self.path)
+        marker = None
+        while True:
+
+            # list bucket
+            result = yield self._list_bucket(prefix=prefix, delimiter='/', marker=marker)
+
+            # iterate prefixes to get image ids
+            for p in result.prefixes:
+                if p != prefix:
+
+                    # extract repo name
+                    repo = p[len(prefix):-1]
+
+                    if repo not in repositories:
+                        repositories.add(repo)
+
+                        # fire callback
+                        self._io_loop.add_callback(callback, repo)
+
+            if not result.truncated:
+                break
+
+            # continue iterating
+            marker = result.next_marker
+
+        LOG.debug("Found: %d repositories", len(repositories))
+
+    @coroutine
+    def get_image_info(self, image):
+        response = yield self._client.fetch(self.get_url("{}/images/{}/json".format(self.path, image)))
+        raise Return(tornado.escape.json_decode(response.body))
+
+    @coroutine
+    def get_image_ancestry(self, image):
+        response = yield self._client.fetch(self.get_url("{}/images/{}/ancestry".format(self.path, image)))
+        raise Return(tornado.escape.json_decode(response.body))
+
+    @coroutine
+    def get_repository_info(self, repository):
+        url = self.get_url("{}/repositories/library/{}/json".format(self.path, repository))
+        response = yield self._client.fetch(url)
+        raise Return(tornado.escape.json_decode(response.body))
+
+    @coroutine
+    def get_repository_index(self, repository):
+        url = self.get_url("{}/repositories/library/{}/_index_images".format(self.path, repository))
+        response = yield self._client.fetch(url)
+        raise Return(tornado.escape.json_decode(response.body))
+
+    @coroutine
+    def get_repository_tags(self, repository):
+        """
+        Return a dict of tags for the given repository
+        :param repository:
+        :return:
+        """
+        tags = {}
+        prefix = "{}/repositories/library/{}/tag_".format(self.path, repository)
+        result = yield self._list_bucket(prefix=prefix, delimiter='/')
+
+        # iterate keys to get contents
+        for key in result.contents:
+            # extract tag
+            tag = key.split('/')[-1].split('_')[-1]
+
+            # fetch image
+            response = yield self._client.fetch(self.get_url(key))
+            image = response.body.decode('utf-8').replace('\"', '')
+
+            tags[tag] = image
+
+        raise Return(tags)
+
+
+class Registry(object):
+    def __init__(self, driver):
+        """
+        Create a new instance of the Registry class
+        :param driver:
+        :return:
+        """
+        self.driver = driver
+        self.graph = None
+
+    def _read_graph(self, path):
+        LOG.debug("Reading graph...")
+        with open(path, 'rb') as f:
+            graph = networkx.readwrite.json_graph.node_link_graph(json.load(f, 'utf-8'), directed=True)
+        LOG.debug("Done!")
+        return graph
+
+    def _write_graph(self, path, overwrite=False):
+        LOG.debug("Writing graph...")
+        if os.path.exists(path):
+            if not overwrite:
+                raise RuntimeError("Refusing to overwrite file: %s", path)
+            else:
+                LOG.warn("Overwriting file: %s", path)
+        with open(path, 'wb') as f:
+            json.dump(networkx.readwrite.json_graph.node_link_data(self.graph), f, indent=4)
+        LOG.debug("Done!")
+
+    def load(self, path):
+        LOG.info("Loading graph from: %s", path)
+        self.graph = self._read_graph(path)
+
+    @coroutine
+    def scan(self, save=None):
+        """
+        Construct the registry graph by scanning
+        :return:
+        """
+
+        # capture start time
+        start_time = datetime.utcnow()
+
+        # initialize the graph
+        self.graph = networkx.DiGraph()
+
+        # scan images
+        yield self._scan_images()
+
+        # save graph
+        self._write_graph('temp.json', True)
+
+        # scan repositories
+        yield self._scan_repositories()
+
+        # save graph
+        if save is not None:
+            self._write_graph(save, True)
+
+        LOG.info("Scan completed in %d seconds", (datetime.utcnow() - start_time).total_seconds())
+
+    @coroutine
+    def _scan_images(self, concurrency=25):
+
+        # initialize Queue
+        queue = toro.JoinableQueue()
+        semaphore = toro.BoundedSemaphore(concurrency)
+        counters = collections.defaultdict(int)
+
+        @coroutine
+        def _process_image():
+
+            # get an image from the queue
+            image = yield queue.get()
+
+            try:
+                # fetch the images ancestry
+                try:
+                    ancestry = yield self.driver.get_image_ancestry(image)
+                except Exception:
+                    LOG.exception("Failed to fetch image ancestry.")
+
+                    # put item back in the queue
+                    queue.put(image)
+                    return
+
+                # add ancestor nodes
+                LOG.debug("Adding image: %s", image)
+                self.graph.add_node(image, tags=[], repos=[], ref=0)
+                self.graph.add_path(ancestry)
+
+                # output progress
+                counters['images'] += 1
+                if counters['images'] > 0 and counters['images'] % 100 == 0:
+                    LOG.info("Processing images: complete=%d, queue=%d", counters['images'], queue.qsize())
+
+            finally:
+                queue.task_done()
+                semaphore.release()
+
+        @coroutine
+        def _process_image_queue():
+
+            while True:
+                # acquire semaphore
+                yield semaphore.acquire()
+
+                # launch task
+                _process_image()
+
+        # start processing queue
+        _process_image_queue()
+
+        # fetch and queue images
+        LOG.info("Fetching images...")
+        yield self.driver.fetch_images(lambda i: queue.put(i))
+
+        # wait for queue to be empty
+        yield queue.join()
+
+    @coroutine
+    def _scan_repositories(self, concurrency=25):
+
+        # initialize Queue
+        queue = toro.JoinableQueue()
+        semaphore = toro.BoundedSemaphore(concurrency)
+        counters = collections.defaultdict(int)
+
+        @coroutine
+        def _process_repository():
+
+            # get an item from the queue
+            repository = yield queue.get()
+
+            try:
+
+                # fetch repository index
+                index = yield self.driver.get_repository_index(repository)
+                for i in index:
+                    try:
+                        # mark indexed image
+                        self.graph.node[i['id']]['repos'].append(repository)
+                    except:
+                        LOG.error("Index image not found in graph: %s (%s)", i['id'], repository)
+                        continue
+
+                # fetch repository tags
+                tags = yield self.driver.get_repository_tags(repository)
+
+                # mark each ancestor of the tagged image
+                for tag, image in tags.iteritems():
+                    LOG.debug("Processing tag: %s (%s/%s)", image, repository, tag)
+
+                    try:
+                        # mark tagged image
+                        self.graph.node[image]['tags'].append("%s:%s" % (repository, tag))
+                    except:
+                        LOG.error("Tagged image not found in graph: %s (%s/%s)", image, repository, tag)
+                        continue
+
+                    # increment counter
+                    counters['tags'] += 1
+
+                    # do depth first search marking successor nodes
+                    for n in networkx.algorithms.dfs_preorder_nodes(self.graph, image):
+                        LOG.debug("Marking: %s (%s/%s)", n, repository, tag)
+
+                        # mark node
+                        self.graph.node[n]['ref'] += 1
+
+                        # increment counter
+                        counters['marked'] += 1
+
+                # output progress
+                counters['repositories'] += 1
+                if counters['repositories'] > 0 and counters['repositories'] % 100 == 0:
+                    LOG.info("Processing repositories: complete=%d, tags=%d, marked=%d, queue=%d",
+                             counters['repositories'],
+                             counters['tags'],
+                             counters['marked'],
+                             queue.qsize())
+
+            except:
+
+                # put item back in the queue
+                queue.put(repository)
+                return
+
+            finally:
+                queue.task_done()
+                semaphore.release()
+
+        @coroutine
+        def _process_repository_queue():
+
+            while True:
+                # acquire semaphore
+                yield semaphore.acquire()
+
+                # launch task
+                _process_repository()
+
+        # start processing queue
+        _process_repository_queue()
+
+        # fetch and queue repositories for processing
+        LOG.info("Fetching repositories")
+        yield self.driver.fetch_repositories(lambda r: queue.put(r))
+
+        # wait for queue to be empty
+        yield queue.join()
+
+    @coroutine
+    def history(self, image):
+        history = []
+
+        # construct tree containing all the descendants of image
+        G = networkx.algorithms.dfs_tree(self.graph, image)
+
+        # sort graph topologically producing an ordered list of nodes
+        for n in networkx.algorithms.topological_sort(G):
+
+            info = yield self.driver.get_image_info(n)
+
+            image_date = from_iso8601(info['created'])
+            image_tags = self.graph.node[n]['tags']
+            image_ref = self.graph.node[n]['ref']
+
+            image_size = 0
+            if 'Size' in info:
+                image_size = info['Size']
+
+            image_cmd = None
+            if 'container_config' in info:
+                if info['container_config']['Cmd'] is not None:
+                    image_cmd = ' '.join(info['container_config']['Cmd'])
+
+            history.append(collections.OrderedDict(id=n,
+                                                   command=image_cmd,
+                                                   size=image_size,
+                                                   ref=image_ref,
+                                                   tags=image_tags,
+                                                   created=to_iso8601(image_date)))
+
+        raise Return(history)
+
+    def _read_sweep_file(self, path='delete.json'):
+        # read sweep file
+        if os.path.exists(path):
+            LOG.debug("Reading sweep file: %s", path)
+            with open(path, 'rb') as f:
+                return {image: from_iso8601(date) for image, date in json.load(f, 'utf-8').iteritems()}
+        return {}
+
+    def _write_sweep_file(self, data, path='delete.json'):
+        # write sweep file
+        LOG.debug("Writing sweep file: %s", path)
+        with open(path, 'wb') as f:
+            json.dump({image: to_iso8601(date) for image, date in data.iteritems()}, f, encoding='utf-8')
+
+    @coroutine
+    def sweep(self, age):
+        """
+        Sweep the graph for unreferenced images
+        :param age:
+        :return:
+        """
+
+        counter = 0
+
+        # traverse the graph to find unreferenced images
+        unreferenced = set()
+        for n, data in self.graph.nodes_iter(True):
+            if data['ref'] < 1:
+                unreferenced.add(n)
+                LOG.debug("Unreferenced image: %s (ref=%d)", n, data['ref'])
+
+            # output progress
+            counter += 1
+            if counter % 1000 == 0:
+                LOG.info("Analyzing images: complete=%d, unmarked=%d", counter, len(unreferenced))
+
+        # get last sweep
+        last_sweep = self._read_sweep_file()
+
+        # gather a set of images to delete by sorting unreferenced images topologically
+        current_sweep = dict()
+        for n in networkx.algorithms.topological_sort(self.graph, unreferenced):
+            # ensure image is unreferenced
+            if n in unreferenced:
+                # if we've already swept the image, use the existing date
+                if n in last_sweep:
+                    current_sweep[n] = last_sweep[n]
+                else:
+                    current_sweep[n] = datetime.utcnow()
+
+        # find the intersection of current and last sweeps
+        to_delete = set()
+        for i in set(current_sweep.keys()) & set(last_sweep.keys()):
+            # only include images that have expired
+            if datetime.utcnow() - last_sweep[i] > age:
+                to_delete.add(i)
+            else:
+                LOG.debug("Skipping image: %s (not old enough)", i)
+
+        # TODO: delete the images
+        print to_delete
+
+        # save next sweep data
+        next_sweep = {x: current_sweep[x] for x in set(current_sweep.keys()) - to_delete}
+        self._write_sweep_file(next_sweep)
+
+
+def init_config(configfile):
+    global CONFIG
+    with open(configfile, 'rb') as fh:
+        CONFIG = yaml.load(fh)
+
+
+def init_log(log_config, log_level=logging.INFO):
+    logging.config.dictConfig(log_config)
+    LOG.setLevel(log_level)
+
+
+def load_driver():
+    if CONFIG['registry']['driver'] == 's3':
+        driver = S3RegistryDriver(CONFIG['registry']['bucket'],
+                                  CONFIG['registry']['path'],
+                                  S3Connection(CONFIG['registry']['access_key'],
+                                               CONFIG['registry']['secret_key']))
+    else:
+        raise ValueError("Unsupported registry driver: %s" % CONFIG['registry']['driver'])
+    return driver
+
+
+@coroutine
+def main():
+    # parse arguments
+    arguments = docopt.docopt(__doc__, version='0.1.0')
+
+    # initialize config
+    init_config(arguments['--config'])
+
+    # initialize log
+    init_log(CONFIG['logging'], logging.DEBUG if arguments['--verbose'] else logging.INFO)
+
+    # initialize Driver
+    driver = load_driver()
+
+    # initialize Registry
+    registry = Registry(driver)
+    if arguments['--graph']:
+        # load graph from file
+        registry.load(arguments['--graph'])
+    else:
+        # construct the graph by scanning the registry
+        yield registry.scan(save=arguments['--save'])
+
+    if arguments['sweep']:
+
+        # run sweep mode
+        yield registry.sweep(age=parse_timedelta(arguments['--age']))
+
+    elif arguments['history']:
+
+        # run history mode
+        history = yield registry.history(arguments['<image>'])
+
+        print json.dumps(history, indent=2)
+
+
+if __name__ == "__main__":
+    tornado.ioloop.IOLoop().current().run_sync(main)
