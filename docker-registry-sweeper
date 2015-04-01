@@ -589,6 +589,7 @@ class Registry(object):
 
     def _read_graph(self, path, format='pickle'):
         LOG.debug("Reading graph...")
+        graph = None
         with open(path, 'rb') as f:
             if format == 'pickle':
                 graph = networkx.readwrite.gpickle.read_gpickle(path)
@@ -686,8 +687,10 @@ class Registry(object):
         @coroutine
         def _process_image_queue():
 
+            # process forever
             while True:
-                # acquire semaphore
+
+                # acquire semaphore to limit concurrency
                 yield semaphore.acquire()
 
                 # launch task
@@ -781,8 +784,10 @@ class Registry(object):
         @coroutine
         def _process_repository_queue():
 
+            # process forever
             while True:
-                # acquire semaphore
+
+                # acquire semaphore to limit concurrency
                 yield semaphore.acquire()
 
                 # launch task
@@ -811,7 +816,7 @@ class Registry(object):
             info = yield self.driver.get_image_info(n)
 
             image_date = from_iso8601(info['created'])
-            image_repos = self.graph.node[n]['repos']
+            image_repo = self.graph.node[n]['repos']
             image_tags = self.graph.node[n]['tags']
 
             image_size = 0
@@ -827,7 +832,7 @@ class Registry(object):
                                                    command=image_cmd,
                                                    size=image_size,
                                                    tags=image_tags,
-                                                   repos=image_repos,
+                                                   repos=image_repo,
                                                    created=to_iso8601(image_date)))
 
         raise Return(history)
@@ -847,10 +852,11 @@ class Registry(object):
             json.dump({image: to_iso8601(date) for image, date in data.iteritems()}, f, encoding='utf-8')
 
     @coroutine
-    def sweep(self, age):
+    def sweep(self, age, dry_run=True):
         """
         Sweep the graph for unreferenced images
         :param age:
+        :param dry_run:
         :return:
         """
 
