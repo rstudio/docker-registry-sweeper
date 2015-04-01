@@ -5,6 +5,10 @@
 Usage:
   docker-registry-sweeper [options] sweep
   docker-registry-sweeper [options] history <image>
+  docker-registry-sweeper [options] tag <repository> <tag>
+  docker-registry-sweeper [options] untag <repository> <tag>
+  docker-registry-sweeper [options] list <repository>
+  docker-registry-sweeper [options] remove <repository>
   docker-registry-sweeper (-h | --help)
   docker-registry-sweeper --version
 
@@ -33,6 +37,7 @@ import re
 import yaml
 import docopt
 import dateutil.parser
+from pprint import pprint
 from datetime import datetime, timedelta
 from xml.etree import cElementTree as etree
 
@@ -65,15 +70,18 @@ def retry(func=None, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
     :return: Future
     """
 
-    def _wrap(func):
-        @functools.wraps(func)
+    if retries < 0:
+        raise ValueError("Retries must be a positive integer.")
+
+    def _wrap(f):
+        @functools.wraps(f)
         def _wrapped(*args, **kwargs):
             attempts = 0
             while True:
                 sleep = delay
                 try:
                     attempts += 1
-                    result = yield func(*args, **kwargs)
+                    result = yield f(*args, **kwargs)
                 except exceptions as ex:
 
                     # let keyboard interrupts through
@@ -89,7 +97,6 @@ def retry(func=None, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
                     else:
                         raise ex
                 raise Return(result)
-
         return coroutine(_wrapped)
 
     if func is not None:
@@ -366,9 +373,7 @@ class S3Client(object):
         h = hashlib.sha256(data.encode('utf-8'))
         return h.hexdigest() if hex else h.digest()
 
-    @retry
-    @coroutine
-    def fetch(self, url, method='GET', headers=None, payload=None):
+    def fetch(self, url, method='GET', headers=None, payload=None, retries=3):
         # LOG.debug("%s: %s", method, url)
 
         # get headers
@@ -390,11 +395,16 @@ class S3Client(object):
         # get Authorization
         headers['Authorization'] = self._get_authorization(url, method, date, headers, hash)
 
-        try:
-            response = yield self._http.fetch(url, method=method, headers=headers, body=payload)
-            raise Return(response)
-        except tornado.httpclient.HTTPError as e:
-            self._handle_error(e)
+        @retry(retries=retries)
+        @coroutine
+        def _fetch():
+            try:
+                response = yield self._http.fetch(url, method=method, headers=headers, body=payload)
+                raise Return(response)
+            except tornado.httpclient.HTTPError as e:
+                self._handle_error(e)
+
+        return _fetch()
 
     def _handle_error(self, e):
         if e.response is not None:
@@ -412,7 +422,51 @@ class S3Client(object):
         raise e
 
 
-class S3RegistryDriver(object):
+class RegistryDriver(object):
+
+    @coroutine
+    def fetch_images(self, callback):
+        raise NotImplementedError()
+
+    @coroutine
+    def fetch_repositories(self, callback):
+        raise NotImplementedError()
+
+    @coroutine
+    def get_image_info(self, image):
+        raise NotImplementedError()
+
+    @coroutine
+    def get_image_ancestry(self, image):
+        raise NotImplementedError()
+
+    @coroutine
+    def get_repository_info(self, repository):
+        raise NotImplementedError()
+
+    @coroutine
+    def get_repository_tags(self, repository):
+        raise NotImplementedError()
+
+    @coroutine
+    def get_repository_index(self, repository):
+        raise NotImplementedError()
+
+    @coroutine
+    def delete_repository_tag(self, repository, tag):
+        raise NotImplementedError()
+
+    @coroutine
+    def delete_repository(self, repository):
+        raise NotImplementedError()
+
+    @coroutine
+    def delete_image(self, image):
+        raise NotImplementedError()
+
+
+class S3RegistryDriver(RegistryDriver):
+
     def __init__(self, bucket, path, connection, secure=True, io_loop=None):
         """
         Create a new instance of the S3RegistryDriver class
@@ -431,14 +485,13 @@ class S3RegistryDriver(object):
         self._io_loop = io_loop or tornado.ioloop.IOLoop.current()
         self._client = S3Client(self.connection, io_loop=io_loop)
 
-
     def _get_endpoint(self):
         if self.connection.region.lower() == 'us-east-1':
             return "s3-external-1.amazonaws.com"  # use ec2 address
         else:
             return "s3-" + self.connection.region + ".amazonaws.com"
 
-    def get_url(self, resource, params=None):
+    def _get_url(self, resource, params=None):
         scheme = "https" if self.secure else "http"
         endpoint = self._get_endpoint()
         url = "{}://{}/{}/{}".format(scheme, endpoint, self.bucket, resource.lstrip("/"))
@@ -449,7 +502,7 @@ class S3RegistryDriver(object):
     @coroutine
     def _list_bucket(self, prefix='', delimiter='', marker=None, max_keys=1000):
         # fetch response
-        response = yield self._client.fetch(self.get_url("/", dict(prefix=prefix,
+        response = yield self._client.fetch(self._get_url("/", dict(prefix=prefix,
                                                                    delimiter=delimiter,
                                                                    marker=marker or '',
                                                                    max_keys=max_keys)))
@@ -532,23 +585,23 @@ class S3RegistryDriver(object):
 
     @coroutine
     def get_image_info(self, image):
-        response = yield self._client.fetch(self.get_url("{}/images/{}/json".format(self.path, image)))
+        response = yield self._client.fetch(self._get_url("{}/images/{}/json".format(self.path, image)))
         raise Return(tornado.escape.json_decode(response.body))
 
     @coroutine
     def get_image_ancestry(self, image):
-        response = yield self._client.fetch(self.get_url("{}/images/{}/ancestry".format(self.path, image)))
+        response = yield self._client.fetch(self._get_url("{}/images/{}/ancestry".format(self.path, image)))
         raise Return(tornado.escape.json_decode(response.body))
 
     @coroutine
     def get_repository_info(self, repository):
-        url = self.get_url("{}/repositories/library/{}/json".format(self.path, repository))
+        url = self._get_url("{}/repositories/library/{}/json".format(self.path, repository))
         response = yield self._client.fetch(url)
         raise Return(tornado.escape.json_decode(response.body))
 
     @coroutine
     def get_repository_index(self, repository):
-        url = self.get_url("{}/repositories/library/{}/_index_images".format(self.path, repository))
+        url = self._get_url("{}/repositories/library/{}/_index_images".format(self.path, repository))
         response = yield self._client.fetch(url)
         raise Return(tornado.escape.json_decode(response.body))
 
@@ -569,12 +622,42 @@ class S3RegistryDriver(object):
             tag = key.split('/')[-1].split('_')[-1]
 
             # fetch image
-            response = yield self._client.fetch(self.get_url(key))
+            response = yield self._client.fetch(self._get_url(key))
             image = response.body.decode('utf-8').replace('\"', '')
 
             tags[tag] = image
 
         raise Return(tags)
+
+    @coroutine
+    def delete_repository_tag(self, repository, tag):
+        pass
+
+    @coroutine
+    def delete_repository(self, repository):
+        pass
+
+    @coroutine
+    def delete_image(self, image):
+
+        # delete only these keys
+        keys = ['_files', '_checksum', 'ancestry', 'json', 'layer']
+
+        for k in keys:
+            url = self._get_url("{}/images/{}/{}".format(self.path, image, k))
+
+            # check if key exists
+            try:
+                response = yield self._client.fetch(url, method='HEAD', retries=0)
+            except tornado.httpclient.HTTPError as e:
+                if e.code == 404:
+                    LOG.warn("Key not found: {}/{}", image, k)
+                    continue
+                else:
+                    raise e
+
+            # delete the key
+            # yield self._client.fetch(url, method='DELETE')
 
 
 class Registry(object):
@@ -816,8 +899,9 @@ class Registry(object):
             info = yield self.driver.get_image_info(n)
 
             image_date = from_iso8601(info['created'])
-            image_repo = self.graph.node[n]['repos']
+            image_marked = self.graph.node[n]['marked']
             image_tags = self.graph.node[n]['tags']
+            image_repo = self.graph.node[n]['repos']
 
             image_size = 0
             if 'Size' in info:
@@ -833,6 +917,7 @@ class Registry(object):
                                                    size=image_size,
                                                    tags=image_tags,
                                                    repos=image_repo,
+                                                   marked=image_marked,
                                                    created=to_iso8601(image_date)))
 
         raise Return(history)
@@ -850,6 +935,15 @@ class Registry(object):
         LOG.debug("Writing sweep file: %s", path)
         with open(path, 'wb') as f:
             json.dump({image: to_iso8601(date) for image, date in data.iteritems()}, f, encoding='utf-8')
+
+    @coroutine
+    def _delete_image(self, image, dry_run):
+
+        print image
+        pprint(self.graph.node[image])
+        pprint(self.graph.predecessors(image))
+
+        raw_input('\n')
 
     @coroutine
     def sweep(self, age, dry_run=True):
@@ -877,16 +971,14 @@ class Registry(object):
         # get last sweep
         last_sweep = self._read_sweep_file()
 
-        # gather a set of images to delete by sorting unreferenced images topologically
+        # gather a set of unreferenced images to delete
         current_sweep = dict()
-        for n in networkx.algorithms.topological_sort(self.graph, unreferenced):
-            # ensure image is unreferenced
-            if n in unreferenced:
-                # if we've already swept the image, use the existing date
-                if n in last_sweep:
-                    current_sweep[n] = last_sweep[n]
-                else:
-                    current_sweep[n] = datetime.utcnow()
+        for n in unreferenced:
+            # if we've already swept the image, use the existing date
+            if n in last_sweep:
+                current_sweep[n] = last_sweep[n]
+            else:
+                current_sweep[n] = datetime.utcnow()
 
         # find the intersection of current and last sweeps
         to_delete = set()
@@ -897,8 +989,10 @@ class Registry(object):
             else:
                 LOG.debug("Skipping image: %s (not old enough)", i)
 
-        # TODO: delete the images
-        print to_delete
+        # delete the images
+        for image in networkx.algorithms.topological_sort(self.graph, to_delete):
+            if image in to_delete:
+                yield self._delete_image(image, dry_run)
 
         # save next sweep data
         next_sweep = {x: current_sweep[x] for x in set(current_sweep.keys()) - to_delete}
