@@ -1034,7 +1034,7 @@ class Registry(object):
 
         # save next sweep data
         next_sweep = {x: current_sweep[x] for x in set(current_sweep.keys()) - deleted}
-        # self._write_sweep_file(next_sweep)
+        self._write_sweep_file(next_sweep)
 
 
 def init_config(configfile):
