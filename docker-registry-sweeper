@@ -629,6 +629,8 @@ class S3RegistryDriver(RegistryDriver):
 
         raise Return(tags)
 
+    # def update_repository_tag(self, reps):
+
     @coroutine
     def delete_repository_tag(self, repository, tag):
         pass
@@ -668,7 +670,7 @@ class Registry(object):
         :return:
         """
         self.driver = driver
-        self.graph = None
+        self.images = None
 
     def _read_graph(self, path, format='pickle'):
         LOG.debug("Reading graph...")
@@ -683,7 +685,7 @@ class Registry(object):
         LOG.debug("Done!")
         return graph
 
-    def _write_graph(self, path, format='pickle', overwrite=False):
+    def _write_graph(self, graph, path, format='pickle', overwrite=False):
         LOG.debug("Writing graph...")
         if os.path.exists(path):
             if not overwrite:
@@ -692,14 +694,16 @@ class Registry(object):
                 LOG.warn("Overwriting file: %s", path)
         with open(path, 'wb') as f:
             if format == 'pickle':
-                networkx.readwrite.gpickle.write_gpickle(self.graph, path)
+                networkx.readwrite.gpickle.write_gpickle(graph, path)
             elif format == 'json':
-                json.dump(networkx.readwrite.json_graph.node_link_data(self.graph), f, indent=4)
+                json.dump(networkx.readwrite.json_graph.node_link_data(graph), f, indent=4)
+            else:
+                raise RuntimeError("Unsupported graph format: %s" % format)
         LOG.debug("Done!")
 
     def load(self, path, format='pickle'):
         LOG.debug("Loading graph from: %s", path)
-        self.graph = self._read_graph(path, format)
+        self.images = self._read_graph(path, format)
 
     @coroutine
     def scan(self, save=None, save_format='pickle'):
@@ -712,20 +716,17 @@ class Registry(object):
         start_time = datetime.utcnow()
 
         # initialize the graph
-        self.graph = networkx.DiGraph()
+        self.images = networkx.DiGraph()
 
         # scan images
         yield self._scan_images()
-
-        # save graph
-        self._write_graph('temp.json', 'json', True)
 
         # scan repositories
         yield self._scan_repositories()
 
         # save graph
         if save is not None:
-            self._write_graph(save, save_format, True)
+            self._write_graph(self.images, save, save_format, True)
 
         LOG.info("Scan completed in %d seconds", (datetime.utcnow() - start_time).total_seconds())
 
@@ -749,8 +750,8 @@ class Registry(object):
 
                 # add ancestor nodes
                 LOG.debug("Adding image: %s", image)
-                self.graph.add_node(image, tags=[], repos=[], marked=False)
-                self.graph.add_path(ancestry)
+                self.images.add_node(image, tags=[], repos=[], marked=False)
+                self.images.add_path(ancestry)
 
                 # output progress
                 counters['images'] += 1
@@ -810,7 +811,7 @@ class Registry(object):
                 for i in index:
                     try:
                         # mark indexed image
-                        self.graph.node[i['id']]['repos'].append(repository)
+                        self.images.node[i['id']]['repos'].append(repository)
                     except:
                         LOG.error("Index image not found in graph: %s (%s)", i['id'], repository)
                         continue
@@ -824,7 +825,7 @@ class Registry(object):
 
                     try:
                         # mark tagged image
-                        self.graph.node[image]['tags'].append("%s:%s" % (repository, tag))
+                        self.images.node[image]['tags'].append("%s:%s" % (repository, tag))
                     except:
                         LOG.error("Tagged image not found in graph: %s (%s/%s)", image, repository, tag)
                         continue
@@ -833,14 +834,14 @@ class Registry(object):
                     counters['tags'] += 1
 
                     # do depth first search marking successor nodes
-                    for n in networkx.algorithms.dfs_preorder_nodes(self.graph, image):
+                    for n in networkx.algorithms.dfs_preorder_nodes(self.images, image):
 
-                        if not self.graph.node[n]['marked']:
+                        if not self.images.node[n]['marked']:
 
                             LOG.debug("Marking: %s (%s/%s)", n, repository, tag)
 
                             # mark node
-                            self.graph.node[n]['marked'] = True
+                            self.images.node[n]['marked'] = True
 
                             # increment counter
                             counters['marked'] += 1
@@ -891,7 +892,7 @@ class Registry(object):
         history = []
 
         # construct tree containing all the descendants of image
-        G = networkx.algorithms.dfs_tree(self.graph, image)
+        G = networkx.algorithms.dfs_tree(self.images, image)
 
         # sort graph topologically producing an ordered list of nodes
         for n in networkx.algorithms.topological_sort(G):
@@ -899,9 +900,9 @@ class Registry(object):
             info = yield self.driver.get_image_info(n)
 
             image_date = from_iso8601(info['created'])
-            image_marked = self.graph.node[n]['marked']
-            image_tags = self.graph.node[n]['tags']
-            image_repo = self.graph.node[n]['repos']
+            image_marked = self.images.node[n]['marked']
+            image_tags = self.images.node[n]['tags']
+            # image_repo = self.images.node[n]['repos']
 
             image_size = 0
             if 'Size' in info:
@@ -916,7 +917,7 @@ class Registry(object):
                                                    command=image_cmd,
                                                    size=image_size,
                                                    tags=image_tags,
-                                                   repos=image_repo,
+                                                   # repos=image_repo,
                                                    marked=image_marked,
                                                    created=to_iso8601(image_date)))
 
@@ -939,11 +940,23 @@ class Registry(object):
     @coroutine
     def _delete_image(self, image, dry_run):
 
-        print image
-        pprint(self.graph.node[image])
-        pprint(self.graph.predecessors(image))
+        print image, self.images.node[image]
 
-        raw_input('\n')
+        assert len(self.images.predecessors(image)) == 0
+
+        # TODO: delete the image
+
+        self.images.remove_node(image)
+
+    @coroutine
+    def _prune_repository(self, repo, images, prune, dry_run):
+
+        # gather a set of images to keep
+        keep = images - prune
+
+        print repo, keep
+
+        # TODO: prune the repository
 
     @coroutine
     def sweep(self, age, dry_run=True):
@@ -954,14 +967,23 @@ class Registry(object):
         :return:
         """
 
+        # create graph for repositories
+        repositories = networkx.DiGraph()
+
         counter = 0
 
         # traverse the graph to find unreferenced images
         unreferenced = set()
-        for n, node_data in self.graph.nodes_iter(True):
+        for image, node_data in self.images.nodes_iter(True):
+
+            # for each repo the image is indexed in insert into repositories graph
+            for repo in node_data['repos']:
+                repositories.add_edge(repo, image)
+
+            # if image is marked, add to unreferenced
             if not node_data['marked']:
-                unreferenced.add(n)
-                LOG.debug("Unreferenced image: %s", n)
+                unreferenced.add(image)
+                LOG.debug("Unreferenced image: %s", image)
 
             # output progress
             counter += 1
@@ -973,26 +995,40 @@ class Registry(object):
 
         # gather a set of unreferenced images to delete
         current_sweep = dict()
-        for n in unreferenced:
+        for image in unreferenced:
             # if we've already swept the image, use the existing date
-            if n in last_sweep:
-                current_sweep[n] = last_sweep[n]
+            if image in last_sweep:
+                current_sweep[image] = last_sweep[image]
             else:
-                current_sweep[n] = datetime.utcnow()
+                current_sweep[image] = datetime.utcnow()
 
         # find the intersection of current and last sweeps
         to_delete = set()
-        for i in set(current_sweep.keys()) & set(last_sweep.keys()):
+        for image in set(current_sweep.keys()) & set(last_sweep.keys()):
             # only include images that have expired
-            if datetime.utcnow() - last_sweep[i] >= age:
-                to_delete.add(i)
+            if datetime.utcnow() - last_sweep[image] >= age:
+                to_delete.add(image)
             else:
-                LOG.debug("Skipping image: %s (not old enough)", i)
+                LOG.debug("Skipping image: %s (not old enough)", image)
 
         # delete the images
-        for image in networkx.algorithms.topological_sort(self.graph, to_delete):
+        for image in networkx.algorithms.topological_sort(self.images, to_delete):
+
+            # topological sort may return other nodes (???)
             if image in to_delete:
+
+                # prune any repositories image is tagged in
+                if image in repositories:
+                    for repo in repositories.predecessors_iter(image):
+
+                        # prune repository
+                        yield self._prune_repository(repo, set(repositories.successors_iter(repo)), {image}, dry_run)
+
+                # delete the image
                 yield self._delete_image(image, dry_run)
+
+                # remove image from repositories graph
+                repositories.remove_node(image)
 
         # save next sweep data
         next_sweep = {x: current_sweep[x] for x in set(current_sweep.keys()) - to_delete}
