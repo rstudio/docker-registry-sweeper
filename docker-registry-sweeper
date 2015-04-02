@@ -5,10 +5,6 @@
 Usage:
   docker-registry-sweeper [options] sweep
   docker-registry-sweeper [options] history <image>
-  docker-registry-sweeper [options] tag <repository> <tag>
-  docker-registry-sweeper [options] untag <repository> <tag>
-  docker-registry-sweeper [options] list <repository>
-  docker-registry-sweeper [options] remove <repository>
   docker-registry-sweeper (-h | --help)
   docker-registry-sweeper --version
 
@@ -37,7 +33,6 @@ import re
 import yaml
 import docopt
 import dateutil.parser
-from pprint import pprint
 from datetime import datetime, timedelta
 from xml.etree import cElementTree as etree
 
@@ -423,6 +418,9 @@ class S3Client(object):
 
 
 class RegistryDriver(object):
+    """
+    An abstract class for storage drivers
+    """
 
     @coroutine
     def fetch_images(self, callback):
