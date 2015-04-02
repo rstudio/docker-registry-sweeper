@@ -10,7 +10,7 @@ may be added in the future.
 The principle of operating behind the docker-registry-sweeper is a mark and sweep. On each run, all images and 
 repositories are scanned, and graph of images and repositories is created. To avoid potential race conditions that are 
 inherit to the way docker-registry works, the docker-registry-sweeper does a multi pass mark and sweep. On the first 
-pass, newly dereferenced images are written to a file. On subsequent sweeps, each image that remains dereferenced for 
+pass, newly dereferenced images are written to a file. On subsequent passes, any image that remains dereferenced for 
 a configurable amount of time will be removed. 
  
 ### Usage
