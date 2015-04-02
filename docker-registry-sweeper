@@ -900,7 +900,6 @@ class Registry(object):
             image_date = from_iso8601(info['created'])
             image_marked = self.images.node[n]['marked']
             image_tags = self.images.node[n]['tags']
-            # image_repo = self.images.node[n]['repos']
 
             image_size = 0
             if 'Size' in info:
@@ -915,7 +914,6 @@ class Registry(object):
                                                    command=image_cmd,
                                                    size=image_size,
                                                    tags=image_tags,
-                                                   # repos=image_repo,
                                                    marked=image_marked,
                                                    created=to_iso8601(image_date)))
 
@@ -938,9 +936,9 @@ class Registry(object):
     @coroutine
     def _delete_image(self, image, dry_run):
 
-        print image, self.images.node[image]
-
         assert len(self.images.predecessors(image)) == 0
+
+        LOG.info("Deleting image: %s", image)
 
         # TODO: delete the image
 
@@ -952,7 +950,7 @@ class Registry(object):
         # gather a set of images to keep
         keep = images - prune
 
-        print repo, keep
+        LOG.info("Pruning repository: %s (removing: %s)", repo, ','.join(prune))
 
         # TODO: prune the repository
 
@@ -968,13 +966,12 @@ class Registry(object):
         # create graph for repositories
         repositories = networkx.DiGraph()
 
-        counter = 0
-
-        # traverse the graph to find unreferenced images
+        # iterate the graph to find unreferenced images
         unreferenced = set()
+        counter = 0
         for image, node_data in self.images.nodes_iter(True):
 
-            # for each repo the image is indexed in insert into repositories graph
+            # for each repo the image is indexed in, insert into repositories graph
             for repo in node_data['repos']:
                 repositories.add_edge(repo, image)
 
@@ -1009,7 +1006,10 @@ class Registry(object):
             else:
                 LOG.debug("Skipping image: %s (not old enough)", image)
 
+        LOG.info("Found %d images to delete", len(to_delete))
+
         # delete the images
+        deleted = set([])
         for image in networkx.algorithms.topological_sort(self.images, to_delete):
 
             # topological sort may return other nodes (???)
@@ -1022,15 +1022,19 @@ class Registry(object):
                         # prune repository
                         yield self._prune_repository(repo, set(repositories.successors_iter(repo)), {image}, dry_run)
 
+                    # remove image from repositories graph
+                    repositories.remove_node(image)
+
                 # delete the image
                 yield self._delete_image(image, dry_run)
 
-                # remove image from repositories graph
-                repositories.remove_node(image)
+                deleted.add(image)
+
+        LOG.debug("Deleted %d images", len(deleted))
 
         # save next sweep data
-        next_sweep = {x: current_sweep[x] for x in set(current_sweep.keys()) - to_delete}
-        self._write_sweep_file(next_sweep)
+        next_sweep = {x: current_sweep[x] for x in set(current_sweep.keys()) - deleted}
+        # self._write_sweep_file(next_sweep)
 
 
 def init_config(configfile):
