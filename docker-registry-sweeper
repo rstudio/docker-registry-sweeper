@@ -140,11 +140,11 @@ def parse_timedelta(v):
     :param v:
     :return: timedelta
     >>> parse_timedelta('6m')
-    360
+    datetime.timedelta(0, 360)
     >>> parse_timedelta('5s')
-    5
+    datetime.timedelta(0, 5)
     >>> parse_timedelta('30')
-    30
+    datetime.timedelta(0, 30)
     """
     def _to_seconds(s):
         seconds_per_unit = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
