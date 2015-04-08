@@ -13,6 +13,7 @@ Options:
   -g --graph=FILE           Load the graph from FILE.
   -F --graph-format=FMT     Graph file format (pickle or json) [default: json]
   -S --save=FILE            Save the graph to FILE (warning: this will overwrite).
+  -C --concurrency=NUM      Scan concurrency [default: 50]
   -a --age=AGE              Only remove images that have been unreferenced for at least AGE. [default: 1d]
   -h --help                 Show this help.
   -V --version              Show version.
@@ -92,6 +93,7 @@ def retry(func=None, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
                     else:
                         raise ex
                 raise Return(result)
+
         return coroutine(_wrapped)
 
     if func is not None:
@@ -146,6 +148,7 @@ def parse_timedelta(v):
     >>> parse_timedelta('30')
     datetime.timedelta(0, 30)
     """
+
     def _to_seconds(s):
         seconds_per_unit = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
         return int(s[:-1]) * seconds_per_unit[s[-1]]
@@ -252,7 +255,7 @@ class S3Client(object):
         tornado.httpclient.AsyncHTTPClient.configure('tornado.curl_httpclient.CurlAsyncHTTPClient', max_clients=100)
         self._http = tornado.httpclient.AsyncHTTPClient(io_loop=io_loop)
 
-    def _get_authorization(self, url, method, date, headers, hash):
+    def _get_authorization(self, url, method, date, headers, payload_hash):
 
         # gather signed headers
         signed_headers = self._get_signed_headers(sorted(headers.items()))
@@ -265,7 +268,7 @@ class S3Client(object):
                                                         method,
                                                         headers,
                                                         signed_headers,
-                                                        hash)
+                                                        payload_hash)
 
         # sign request
         signature_algorithm = 'AWS4-HMAC-SHA256'
@@ -302,11 +305,11 @@ class S3Client(object):
     def _get_signing_key(self, scope):
         parts = scope.split('/')
         key = "AWS4" + self._conn.secret_key
-        hash = self._calculate_hmac(key, parts[0], False)
-        hash = self._calculate_hmac(hash, parts[1], False)
-        hash = self._calculate_hmac(hash, parts[2], False)
-        hash = self._calculate_hmac(hash, parts[3], False)
-        return hash
+        h = self._calculate_hmac(key, parts[0], False)
+        h = self._calculate_hmac(h, parts[1], False)
+        h = self._calculate_hmac(h, parts[2], False)
+        h = self._calculate_hmac(h, parts[3], False)
+        return h
 
     def _get_signature_scope(self, date):
         return "/".join((date.strftime("%Y%m%d"), self._conn.region, "s3", "aws4_request"))
@@ -326,7 +329,7 @@ class S3Client(object):
     def _get_signed_headers(self, headers):
         return ";".join([k.lower() for k, v in headers])
 
-    def _get_canonical_request(self, url, method, headers, signed_headers, hash):
+    def _get_canonical_request(self, url, method, headers, signed_headers, payload_hash):
 
         url_parts = urlparse.urlparse(url)
 
@@ -352,7 +355,7 @@ class S3Client(object):
                           request_query,
                           request_headers,
                           signed_headers,
-                          hash))
+                          payload_hash))
 
     @staticmethod
     def _calculate_hmac(key, data, hex=True):
@@ -464,7 +467,6 @@ class RegistryDriver(object):
 
 
 class S3RegistryDriver(RegistryDriver):
-
     def __init__(self, bucket, path, connection, secure=True, io_loop=None):
         """
         Create a new instance of the S3RegistryDriver class
@@ -501,9 +503,9 @@ class S3RegistryDriver(RegistryDriver):
     def _list_bucket(self, prefix='', delimiter='', marker=None, max_keys=1000):
         # fetch response
         response = yield self._client.fetch(self._get_url("/", dict(prefix=prefix,
-                                                                   delimiter=delimiter,
-                                                                   marker=marker or '',
-                                                                   max_keys=max_keys)))
+                                                                    delimiter=delimiter,
+                                                                    marker=marker or '',
+                                                                    max_keys=max_keys)))
         # parse response
         raise Return(S3ListBucketResult.parse(response.buffer))
 
@@ -656,8 +658,8 @@ class S3RegistryDriver(RegistryDriver):
                 else:
                     raise e
 
-            # delete the key
-            # yield self._client.fetch(url, method='DELETE')
+                    # delete the key
+                    # yield self._client.fetch(url, method='DELETE')
 
 
 class Registry(object):
@@ -668,9 +670,9 @@ class Registry(object):
         :return:
         """
         self.driver = driver
-        self.images = None
+        self.graph = None
 
-    def _read_graph(self, path, format='pickle'):
+    def _read_graph(self, path, format='json'):
         LOG.debug("Reading graph...")
         graph = None
         with open(path, 'rb') as f:
@@ -683,7 +685,7 @@ class Registry(object):
         LOG.debug("Done!")
         return graph
 
-    def _write_graph(self, graph, path, format='pickle', overwrite=False):
+    def _write_graph(self, graph, path, format='json', overwrite=False):
         LOG.debug("Writing graph...")
         if os.path.exists(path):
             if not overwrite:
@@ -699,14 +701,16 @@ class Registry(object):
                 raise RuntimeError("Unsupported graph format: %s" % format)
         LOG.debug("Done!")
 
-    def load(self, path, format='pickle'):
+    def load(self, path, format='json'):
         LOG.debug("Loading graph from: %s", path)
-        self.images = self._read_graph(path, format)
+        self.graph = self._read_graph(path, format)
 
     @coroutine
-    def scan(self, save=None, save_format='pickle'):
+    def scan(self, save=None, save_format='json'):
         """
         Construct the registry graph by scanning
+        :param save:
+        :param save_format:
         :return:
         """
 
@@ -714,7 +718,7 @@ class Registry(object):
         start_time = datetime.utcnow()
 
         # initialize the graph
-        self.images = networkx.DiGraph()
+        self.graph = networkx.DiGraph()
 
         # scan images
         yield self._scan_images()
@@ -724,7 +728,7 @@ class Registry(object):
 
         # save graph
         if save is not None:
-            self._write_graph(self.images, save, save_format, True)
+            self._write_graph(self.graph, save, save_format, True)
 
         LOG.info("Scan completed in %d seconds", (datetime.utcnow() - start_time).total_seconds())
 
@@ -743,13 +747,16 @@ class Registry(object):
             image = yield queue.get()
 
             try:
+
+                LOG.debug("Processing: %s", image)
+
                 # fetch the image ancestry
                 ancestry = yield self.driver.get_image_ancestry(image)
 
                 # add ancestor nodes
                 LOG.debug("Adding image: %s", image)
-                self.images.add_node(image, tags=[], repos=[], marked=False)
-                self.images.add_path(ancestry)
+                self.graph.add_node(image, tags=[], repos=[], marked=False)
+                self.graph.add_path(ancestry)
 
                 # output progress
                 counters['images'] += 1
@@ -775,7 +782,7 @@ class Registry(object):
                 # acquire semaphore to limit concurrency
                 yield semaphore.acquire()
 
-                # launch task
+                # process image
                 _process_image()
 
         # start processing queue
@@ -783,7 +790,7 @@ class Registry(object):
 
         # fetch and queue images
         LOG.debug("Fetching images...")
-        yield self.driver.fetch_images(lambda i: queue.put(i))
+        yield self.driver.fetch_images(queue.put)
 
         # wait for queue to be empty
         yield queue.join()
@@ -809,9 +816,9 @@ class Registry(object):
                 for i in index:
                     try:
                         # mark indexed image
-                        self.images.node[i['id']]['repos'].append(repository)
-                    except:
-                        LOG.error("Index image not found in graph: %s (%s)", i['id'], repository)
+                        self.graph.node[i['id']]['repos'].append(repository)
+                    except KeyError:
+                        LOG.error("Indexed image not found in graph: %s (%s)", i['id'], repository)
                         continue
 
                 # fetch repository tags
@@ -823,8 +830,8 @@ class Registry(object):
 
                     try:
                         # mark tagged image
-                        self.images.node[image]['tags'].append("%s:%s" % (repository, tag))
-                    except:
+                        self.graph.node[image]['tags'].append("%s:%s" % (repository, tag))
+                    except KeyError:
                         LOG.error("Tagged image not found in graph: %s (%s/%s)", image, repository, tag)
                         continue
 
@@ -832,17 +839,21 @@ class Registry(object):
                     counters['tags'] += 1
 
                     # do depth first search marking successor nodes
-                    for n in networkx.algorithms.dfs_preorder_nodes(self.images, image):
+                    for n in networkx.algorithms.dfs_preorder_nodes(self.graph, image):
 
-                        if not self.images.node[n]['marked']:
+                        if not self.graph.node[n]['marked']:
 
                             LOG.debug("Marking: %s (%s/%s)", n, repository, tag)
 
                             # mark node
-                            self.images.node[n]['marked'] = True
+                            self.graph.node[n]['marked'] = True
 
                             # increment counter
                             counters['marked'] += 1
+
+                        else:
+                            # no need to continue, deeper nodes should already be marked
+                            break
 
                 # output progress
                 counters['repositories'] += 1
@@ -868,11 +879,10 @@ class Registry(object):
 
             # process forever
             while True:
-
                 # acquire semaphore to limit concurrency
                 yield semaphore.acquire()
 
-                # launch task
+                # process repository
                 _process_repository()
 
         # start processing queue
@@ -880,7 +890,7 @@ class Registry(object):
 
         # fetch and queue repositories for processing
         LOG.debug("Fetching repositories...")
-        yield self.driver.fetch_repositories(lambda r: queue.put(r))
+        yield self.driver.fetch_repositories(queue.put)
 
         # wait for queue to be empty
         yield queue.join()
@@ -890,20 +900,17 @@ class Registry(object):
         history = []
 
         # construct tree containing all the descendants of image
-        G = networkx.algorithms.dfs_tree(self.images, image)
+        G = networkx.algorithms.dfs_tree(self.graph, image)
 
         # sort graph topologically producing an ordered list of nodes
         for n in networkx.algorithms.topological_sort(G):
 
             info = yield self.driver.get_image_info(n)
 
+            image_marked = self.graph.node[n]['marked']
+            image_tags = self.graph.node[n]['tags']
             image_date = from_iso8601(info['created'])
-            image_marked = self.images.node[n]['marked']
-            image_tags = self.images.node[n]['tags']
-
-            image_size = 0
-            if 'Size' in info:
-                image_size = info['Size']
+            image_size = info.get('Size', 0)
 
             image_cmd = None
             if 'container_config' in info:
@@ -936,13 +943,13 @@ class Registry(object):
     @coroutine
     def _delete_image(self, image, dry_run):
 
-        assert len(self.images.predecessors(image)) == 0
+        assert len(self.graph.predecessors(image)) == 0
 
         LOG.info("Deleting image: %s", image)
 
         # TODO: delete the image
 
-        self.images.remove_node(image)
+        self.graph.remove_node(image)
 
     @coroutine
     def _prune_repository(self, repo, images, prune, dry_run):
@@ -966,17 +973,17 @@ class Registry(object):
         # create graph for repositories
         repositories = networkx.DiGraph()
 
-        # iterate the graph to find unreferenced images
-        unreferenced = set()
+        # iterate the images subgraph to find unreferenced images
         counter = 0
-        for image, node_data in self.images.nodes_iter(True):
+        unreferenced = set()
+        for image, data in self.graph.nodes_iter(True):
 
             # for each repo the image is indexed in, insert into repositories graph
-            for repo in node_data['repos']:
+            for repo in data['repos']:
                 repositories.add_edge(repo, image)
 
-            # if image is marked, add to unreferenced
-            if not node_data['marked']:
+            # if image is not marked, add to unreferenced
+            if not data['marked']:
                 unreferenced.add(image)
                 LOG.debug("Unreferenced image: %s", image)
 
@@ -985,23 +992,20 @@ class Registry(object):
             if counter % 1000 == 0:
                 LOG.info("Analyzing images: complete=%d, unmarked=%d", counter, len(unreferenced))
 
-        # get last sweep
+        # read last sweep
         last_sweep = self._read_sweep_file()
 
         # gather a set of unreferenced images to delete
         current_sweep = dict()
         for image in unreferenced:
             # if we've already swept the image, use the existing date
-            if image in last_sweep:
-                current_sweep[image] = last_sweep[image]
-            else:
-                current_sweep[image] = datetime.utcnow()
+            current_sweep[image] = last_sweep.get(image, datetime.utcnow())
 
         # find the intersection of current and last sweeps
         to_delete = set()
-        for image in set(current_sweep.keys()) & set(last_sweep.keys()):
+        for image in current_sweep.iterkeys():
             # only include images that have expired
-            if datetime.utcnow() - last_sweep[image] >= age:
+            if datetime.utcnow() - current_sweep[image] >= age:
                 to_delete.add(image)
             else:
                 LOG.debug("Skipping image: %s (not old enough)", image)
@@ -1009,31 +1013,28 @@ class Registry(object):
         LOG.info("Found %d images to delete", len(to_delete))
 
         # delete the images
+        # note: toposort images so that non-dependant images are deleted first
         deleted = set([])
-        for image in networkx.algorithms.topological_sort(self.images, to_delete):
+        for image in networkx.algorithms.topological_sort(self.graph.subgraph(to_delete)):
 
-            # topological sort may return other nodes (???)
-            if image in to_delete:
+            # prune any repositories image is tagged in
+            if image in repositories:
+                for repo in repositories.predecessors_iter(image):
+                    # prune repository
+                    yield self._prune_repository(repo, set(repositories.successors_iter(repo)), {image}, dry_run)
 
-                # prune any repositories image is tagged in
-                if image in repositories:
-                    for repo in repositories.predecessors_iter(image):
+                # remove image from repositories graph
+                repositories.remove_node(image)
 
-                        # prune repository
-                        yield self._prune_repository(repo, set(repositories.successors_iter(repo)), {image}, dry_run)
+            # delete the image
+            yield self._delete_image(image, dry_run)
 
-                    # remove image from repositories graph
-                    repositories.remove_node(image)
-
-                # delete the image
-                yield self._delete_image(image, dry_run)
-
-                deleted.add(image)
+            deleted.add(image)
 
         LOG.debug("Deleted %d images", len(deleted))
 
         # save next sweep data
-        next_sweep = {x: current_sweep[x] for x in set(current_sweep.keys()) - deleted}
+        next_sweep = {x:y for x,y in current_sweep.iteritems() if x not in deleted}
         self._write_sweep_file(next_sweep)
 
 
@@ -1092,7 +1093,6 @@ def main():
 
         # run history mode
         history = yield registry.history(arguments['<image>'])
-
         print json.dumps(history, indent=2)
 
 
