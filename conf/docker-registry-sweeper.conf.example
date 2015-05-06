@@ -1,0 +1,38 @@
+registry:
+  driver: s3
+  access_key: ACCESS-KEY-ID
+  secret_key: SECRET-KEY
+  bucket: my-bucket
+  path: production
+
+# logging configuration
+logging:
+  version: 1
+  disable_existing_loggers: true
+
+  root:
+    level: !!python/name:logging.ERROR
+    handlers: [console]
+
+  loggers:
+
+    docker-registry-sweeper:
+      level: !!python/name:logging.DEBUG
+      handlers: [console]
+      qualname: docker-registry-sweeper
+      propagate: false
+
+  handlers:
+    console:
+      class: logging.StreamHandler
+      formatter: format.color
+      stream: ext://sys.stdout
+      level: !!python/name:logging.NOTSET
+
+  formatters:
+    format.color:
+      (): !!python/name:tornado.log.LogFormatter
+      fmt:  '%(color)s[%(levelname)s %(asctime)s]%(end_color)s %(message)s'
+      datefmt: '%y-%m-%dT%H:%M:%S'
+    format.default:
+      format: '[%(levelname)s] [%(asctime)s] %(message)s'
