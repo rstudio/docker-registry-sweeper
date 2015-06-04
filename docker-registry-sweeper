@@ -13,13 +13,13 @@ Options:
   -c --config=FILE          Path to configuration file. [default: conf/docker-registry-sweeper.conf]
   -g --graph=FILE           Load the graph from FILE.
   -f --graph-format=FORMAT  Graph format [default: json]
-  -e --blacklist=REPO       Exclude deleting images from the these repositories (comma separated list)
-  -p --prune                Enabled repository pruning [default: False]
   -V --version              Show version.
   -v --verbose              Enable verbose output.
 
 Options (sweep sweep):
   -C --concurrency=NUM      Scan concurrency [default: 50]
+  -e --blacklist=REPO       Exclude deleting images from the these repositories (comma separated list)
+  -p --prune                Enabled repository pruning [default: False]
   -s --save=FILE            Save the graph to FILE (warning: this will overwrite).
   -a --age=AGE              Only remove images that have been unreferenced for at least AGE. [default: 1d]
   -d --delete               Delete images [default: False]
