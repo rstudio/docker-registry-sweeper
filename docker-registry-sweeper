@@ -4,21 +4,29 @@
 
 Usage:
   docker-registry-sweeper [options] sweep
-  docker-registry-sweeper [options] history <image>
+  docker-registry-sweeper [options] history repository <repository> 
+  docker-registry-sweeper [options] history image <image>
   docker-registry-sweeper (-h | --help)
   docker-registry-sweeper --version
 
 Options:
   -c --config=FILE          Path to configuration file. [default: conf/docker-registry-sweeper.conf]
   -g --graph=FILE           Load the graph from FILE.
-  -F --graph-format=FMT     Graph file format (pickle or json) [default: json]
-  -S --save=FILE            Save the graph to FILE (warning: this will overwrite).
-  -C --concurrency=NUM      Scan concurrency [default: 50]
-  -a --age=AGE              Only remove images that have been unreferenced for at least AGE. [default: 1d]
-  -h --help                 Show this help.
+  -f --graph-format=FORMAT  Graph format [default: json]
+  -e --blacklist=REPO       Exclude deleting images from the these repositories (comma separated list)
+  -p --prune                Enabled repository pruning [default: False]
   -V --version              Show version.
   -v --verbose              Enable verbose output.
 
+Options (sweep sweep):
+  -C --concurrency=NUM      Scan concurrency [default: 50]
+  -s --save=FILE            Save the graph to FILE (warning: this will overwrite).
+  -a --age=AGE              Only remove images that have been unreferenced for at least AGE. [default: 1d]
+  -d --delete               Delete images [default: False]
+  -h --help                 Show this help.
+
+Options (history mode):
+  -u --unmarked             Show only unmarked images
 """
 import functools
 import hashlib
@@ -50,6 +58,9 @@ import tornado.httpclient
 import tornado.httputil
 
 from tornado.gen import coroutine, Return
+
+
+CONFIG = None
 
 
 LOG = logging.getLogger('docker-registry-sweeper')
@@ -84,7 +95,8 @@ def retry(func=None, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
                     if isinstance(ex, KeyboardInterrupt) and ex not in exceptions:
                         raise ex
 
-                    LOG.error(ex.message)
+                    LOG.exception(ex)
+
                     if attempts <= retries:
                         LOG.warn("Retrying... (%d)", attempts)
                         yield tornado.gen.sleep(sleep)
@@ -393,7 +405,6 @@ class S3Client(object):
         # get Authorization
         headers['Authorization'] = self._get_authorization(url, method, date, headers, hash)
 
-        @retry(retries=retries)
         @coroutine
         def _fetch():
             try:
@@ -402,21 +413,26 @@ class S3Client(object):
             except tornado.httpclient.HTTPError as e:
                 self._handle_error(e)
 
-        return _fetch()
+        # optionally retry request if it fails
+        if retries:
+            @retry(retries=retries, exceptions=(tornado.httpclient.HTTPError))
+            def _fetch_with_retry():
+                return _fetch()
+            return _fetch_with_retry()
+        else:
+            return _fetch()
 
     def _handle_error(self, e):
-        if e.response is not None:
+        if e.response is not None and e.response.body:
             if e.response.headers.get('Content-Type') == 'application/xml':
-                if e.response.body:
-                    try:
-                        # parse xml response
-                        doc = etree.fromstring(e.response.body)
-                        message = doc.find('./Message')
-                        if message is not None:
-                            raise S3Error(message.text)
-                    except etree.ParseError as e:
-                        LOG.exception("Error parsing response error.")
-            LOG.warn("Unable to parse response error.")
+                try:
+                    # parse xml response
+                    doc = etree.fromstring(e.response.body)
+                    message = doc.find('./Message')
+                    if message is not None:
+                        raise S3Error(message.text)
+                except etree.ParseError:
+                    LOG.exception("Unable to parse response error")
         raise e
 
 
@@ -629,8 +645,6 @@ class S3RegistryDriver(RegistryDriver):
 
         raise Return(tags)
 
-    # def update_repository_tag(self, reps):
-
     @coroutine
     def delete_repository_tag(self, repository, tag):
         pass
@@ -653,13 +667,15 @@ class S3RegistryDriver(RegistryDriver):
                 response = yield self._client.fetch(url, method='HEAD', retries=0)
             except tornado.httpclient.HTTPError as e:
                 if e.code == 404:
-                    LOG.warn("Key not found: {}/{}", image, k)
                     continue
                 else:
                     raise e
 
-                    # delete the key
-                    # yield self._client.fetch(url, method='DELETE')
+            # delete the key
+            # yield self._client.fetch(url, method='DELETE')
+
+            LOG.debug("Deleted: %s/%s", image, k)
+
 
 
 class Registry(object):
@@ -879,6 +895,7 @@ class Registry(object):
 
             # process forever
             while True:
+
                 # acquire semaphore to limit concurrency
                 yield semaphore.acquire()
 
@@ -896,7 +913,10 @@ class Registry(object):
         yield queue.join()
 
     @coroutine
-    def history(self, image):
+    def image_history(self, image, filter_marked=False):
+
+        LOG.debug("Getting image history: %s", image)
+
         history = []
 
         # construct tree containing all the descendants of image
@@ -908,7 +928,12 @@ class Registry(object):
             info = yield self.driver.get_image_info(n)
 
             image_marked = self.graph.node[n]['marked']
+
+            if filter_marked and image_marked:
+                continue
+
             image_tags = self.graph.node[n]['tags']
+            image_repo = self.graph.node[n]['repos']
             image_date = from_iso8601(info['created'])
             image_size = info.get('Size', 0)
 
@@ -920,9 +945,35 @@ class Registry(object):
             history.append(collections.OrderedDict(id=n,
                                                    command=image_cmd,
                                                    size=image_size,
+                                                   repos=image_repo,
                                                    tags=image_tags,
                                                    marked=image_marked,
                                                    created=to_iso8601(image_date)))
+
+        raise Return(history)
+
+    @coroutine
+    def repository_history(self, repository, filter_marked=False):
+
+        LOG.debug("Getting repository history: %s", repository)
+
+        # create graph for repositories
+        repositories = networkx.DiGraph()
+
+        # iterate the images graph to find unreferenced images
+        for image, data in self.graph.nodes_iter(True):
+
+            # for each repo the image is indexed in, insert into repositories graph
+            tags = [(repo, tag) for repo,_,tag in [t.partition(':') for t in data['tags']]]
+            for (repo, tag) in tags:
+                repositories.add_edge(repo, image, tag=tag)
+
+        # get image history
+        history = {}
+
+        if repository in repositories:
+            for i in networkx.algorithms.descendants(repositories, repository):
+                history[i] = yield self.image_history(i, filter_marked)
 
         raise Return(history)
 
@@ -942,13 +993,20 @@ class Registry(object):
 
     @coroutine
     def _delete_image(self, image, dry_run):
-
         assert len(self.graph.predecessors(image)) == 0
 
-        LOG.info("Deleting image: %s", image)
+        tags = self.graph.node[image]['tags']
+        repo = self.graph.node[image]['repos']
 
         # TODO: delete the image
+        if dry_run:
+            LOG.info("(Dry run) Deleting image: %s, %s %s", image, tags, repo)
+        else:
+            LOG.info("Deleting image: %s, %s", image)
 
+            yield self.driver.delete_image(image)
+
+        # remove the node from the graph
         self.graph.remove_node(image)
 
     @coroutine
@@ -962,13 +1020,17 @@ class Registry(object):
         # TODO: prune the repository
 
     @coroutine
-    def sweep(self, age, dry_run=True):
+    def sweep(self, age, blacklist=None, prune=False, dry_run=True):
         """
         Sweep the graph for unreferenced images
         :param age:
+        :param blacklist
+        :param prune
         :param dry_run:
         :return:
         """
+
+        blacklist = blacklist or []
 
         # create graph for repositories
         repositories = networkx.DiGraph()
@@ -977,6 +1039,12 @@ class Registry(object):
         counter = 0
         unreferenced = set()
         for image, data in self.graph.nodes_iter(True):
+
+            # check if image is tagged in a blacklisted repo
+            blacklisted = set(data['repos']) & set(blacklist)
+            if blacklisted:
+                LOG.warn("Skipping image: %s (blacklisted %s)", image, blacklisted)
+                continue
 
             # for each repo the image is indexed in, insert into repositories graph
             for repo in data['repos']:
@@ -998,12 +1066,14 @@ class Registry(object):
         # gather a set of unreferenced images to delete
         current_sweep = dict()
         for image in unreferenced:
+
             # if we've already swept the image, use the existing date
             current_sweep[image] = last_sweep.get(image, datetime.utcnow())
 
         # find the intersection of current and last sweeps
         to_delete = set()
         for image in current_sweep.iterkeys():
+
             # only include images that have expired
             if datetime.utcnow() - current_sweep[image] >= age:
                 to_delete.add(image)
@@ -1012,23 +1082,34 @@ class Registry(object):
 
         LOG.info("Found %d images to delete", len(to_delete))
 
-        # delete the images
-        # note: toposort images so that non-dependant images are deleted first
+        # delete the images in toposort order so that non-dependant images are deleted first
         deleted = set([])
         for image in networkx.algorithms.topological_sort(self.graph.subgraph(to_delete)):
 
-            # prune any repositories image is tagged in
-            if image in repositories:
-                for repo in repositories.predecessors_iter(image):
-                    # prune repository
-                    yield self._prune_repository(repo, set(repositories.successors_iter(repo)), {image}, dry_run)
+            if prune:
+                # if pruning is enabled, before deleting the image remove the image from the repository index
 
-                # remove image from repositories graph
-                repositories.remove_node(image)
+                # prune any repositories image is tagged in
+                if image in repositories:
+
+                    for repo in repositories.predecessors_iter(image):
+
+                        # prune repository
+                        yield self._prune_repository(repo, set(repositories.successors_iter(repo)), {image}, dry_run)
+
+                    # remove image from repositories graph
+                    repositories.remove_node(image)
+
+            else:
+                # if pruning is not enabled, skip the image entirely
+                if image in repositories:
+                    LOG.warn("Skipping image: %s (pruning disabled)", image)
+                    continue
 
             # delete the image
             yield self._delete_image(image, dry_run)
 
+            # add to deleted
             deleted.add(image)
 
         LOG.debug("Deleted %d images", len(deleted))
@@ -1077,9 +1158,11 @@ def main():
     # initialize Registry
     registry = Registry(driver)
     if arguments['--graph']:
+
         # load graph from file
         registry.load(arguments['--graph'], arguments['--graph-format'])
     else:
+
         # construct the graph by scanning the registry
         yield registry.scan(save=arguments['--save'],
                             save_format=arguments['--graph-format'])
@@ -1087,13 +1170,25 @@ def main():
     if arguments['sweep']:
 
         # run sweep mode
-        yield registry.sweep(age=parse_timedelta(arguments['--age']))
+        yield registry.sweep(age=parse_timedelta(arguments['--age']),
+                             prune=arguments['--prune'],
+                             blacklist=arguments['--blacklist'].split(','),
+                             dry_run=not arguments['--delete'])
 
     elif arguments['history']:
 
-        # run history mode
-        history = yield registry.history(arguments['<image>'])
-        print json.dumps(history, indent=2)
+        if arguments['image']:
+
+            # run history mode
+            history = yield registry.image_history(arguments['<image>'],
+                                                   filter_marked=arguments['--unmarked'])
+            print json.dumps(history, indent=2)
+
+        elif arguments['repository']:
+
+            history = yield registry.repository_history(arguments['<repository>'],
+                                                        filter_marked=arguments['--unmarked'])
+            print json.dumps(history, indent=2)
 
 
 if __name__ == "__main__":
