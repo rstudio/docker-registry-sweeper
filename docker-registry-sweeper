@@ -995,14 +995,10 @@ class Registry(object):
     def _delete_image(self, image, dry_run):
         assert len(self.graph.predecessors(image)) == 0
 
-        tags = self.graph.node[image]['tags']
-        repo = self.graph.node[image]['repos']
-
-        # TODO: delete the image
         if dry_run:
-            LOG.info("(Dry run) Deleting image: %s, %s %s", image, tags, repo)
+            LOG.info("(Dry run) Deleting image: %s", image)
         else:
-            LOG.info("Deleting image: %s, %s", image)
+            LOG.info("Deleting image: %s", image)
 
             yield self.driver.delete_image(image)
 
@@ -1043,7 +1039,7 @@ class Registry(object):
             # check if image is tagged in a blacklisted repo
             blacklisted = set(data['repos']) & set(blacklist)
             if blacklisted:
-                LOG.warn("Skipping image: %s (blacklisted %s)", image, blacklisted)
+                LOG.warn("Skipping image: %s (blacklisted: %s)", image, ','.join(blacklisted))
                 continue
 
             # for each repo the image is indexed in, insert into repositories graph
@@ -1105,6 +1101,10 @@ class Registry(object):
                 if image in repositories:
                     LOG.warn("Skipping image: %s (pruning disabled)", image)
                     continue
+
+                # one last check before we delete
+                assert len(self.graph.node[image]['tags']) == 0
+                assert len(self.graph.node[image]['repos']) == 0
 
             # delete the image
             yield self._delete_image(image, dry_run)
