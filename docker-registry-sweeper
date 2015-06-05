@@ -42,6 +42,7 @@ import re
 import yaml
 import docopt
 import dateutil.parser
+
 from datetime import datetime, timedelta
 from xml.etree import cElementTree as etree
 
@@ -664,7 +665,7 @@ class S3RegistryDriver(RegistryDriver):
 
             # check if key exists
             try:
-                response = yield self._client.fetch(url, method='HEAD', retries=0)
+                yield self._client.fetch(url, method='HEAD', retries=0)
             except tornado.httpclient.HTTPError as e:
                 if e.code == 404:
                     continue
@@ -672,7 +673,7 @@ class S3RegistryDriver(RegistryDriver):
                     raise e
 
             # delete the key
-            # yield self._client.fetch(url, method='DELETE')
+            yield self._client.fetch(url, method='DELETE')
 
             LOG.debug("Deleted: %s/%s", image, k)
 
@@ -999,7 +1000,6 @@ class Registry(object):
             LOG.info("(Dry run) Deleting image: %s", image)
         else:
             LOG.info("Deleting image: %s", image)
-
             yield self.driver.delete_image(image)
 
         # remove the node from the graph
@@ -1016,13 +1016,13 @@ class Registry(object):
         # TODO: prune the repository
 
     @coroutine
-    def sweep(self, age, blacklist=None, prune=False, dry_run=True):
+    def sweep(self, age, prune=False, blacklist=None, dry_run=True):
         """
         Sweep the graph for unreferenced images
         :param age:
-        :param blacklist
         :param prune
         :param dry_run:
+        :param blacklist
         :return:
         """
 
@@ -1112,7 +1112,7 @@ class Registry(object):
             # add to deleted
             deleted.add(image)
 
-        LOG.debug("Deleted %d images", len(deleted))
+        LOG.info("Deleted %d images", len(deleted))
 
         # save next sweep data
         next_sweep = {x:y for x,y in current_sweep.iteritems() if x not in deleted}
