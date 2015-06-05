@@ -16,7 +16,7 @@ Options:
   -V --version              Show version.
   -v --verbose              Enable verbose output.
 
-Options (sweep sweep):
+Options (sweep mode):
   -C --concurrency=NUM      Scan concurrency [default: 50]
   -e --blacklist=REPO       Exclude deleting images from the these repositories (comma separated list)
   -p --prune                Enabled repository pruning [default: False]
