@@ -416,7 +416,7 @@ class S3Client(object):
 
         # optionally retry request if it fails
         if retries:
-            @retry(retries=retries, exceptions=(tornado.httpclient.HTTPError))
+            @retry(retries=retries)
             def _fetch_with_retry():
                 return _fetch()
             return _fetch_with_retry()
