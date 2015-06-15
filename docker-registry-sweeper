@@ -84,6 +84,7 @@ def retry(func=None, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
     def _wrap(f):
         @functools.wraps(f)
         def _wrapped(*args, **kwargs):
+            error = None
             attempts = 0
             while True:
                 sleep = delay
@@ -104,9 +105,12 @@ def retry(func=None, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
                         sleep += backoff
                         continue
                     else:
-                        raise ex
-                raise Return(result)
-
+                        error = ex
+                        break
+                else:
+                    raise Return(result)
+            if error is not None:
+                raise ex
         return coroutine(_wrapped)
 
     if func is not None:
