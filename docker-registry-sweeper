@@ -73,7 +73,7 @@ def retry(func=None, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
     :param func:
     :param retries: max number of retries
     :param delay: delay between retries (in seconds)
-    :param backoff: backoff between retries (in seconds)
+    :param backoff: backoff after retrying (in seconds)
     :param exceptions: exceptions to retry on
     :return: Future
     """
@@ -86,11 +86,12 @@ def retry(func=None, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
         def _wrapped(*args, **kwargs):
             result = None
             attempts = 0
+            sleep = delay
             while True:
-                sleep = delay
                 try:
                     attempts += 1
-                    # execute func
+
+                    # execute
                     ret = yield f(*args, **kwargs)
 
                 except exceptions as ex:
@@ -118,6 +119,7 @@ def retry(func=None, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
                 else:
                     # no error
                     result = Return(ret)
+                    break
 
             # raise result
             if result is not None:
