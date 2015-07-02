@@ -84,19 +84,25 @@ def retry(func=None, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
     def _wrap(f):
         @functools.wraps(f)
         def _wrapped(*args, **kwargs):
-            error = None
+            result = None
             attempts = 0
             while True:
                 sleep = delay
                 try:
                     attempts += 1
-                    result = yield f(*args, **kwargs)
+                    # execute func
+                    ret = yield f(*args, **kwargs)
+
                 except exceptions as ex:
+                    # handle error
 
-                    # let keyboard interrupts through
-                    if isinstance(ex, KeyboardInterrupt) and ex not in exceptions:
-                        raise ex
+                    # raise keyboard interrupts or any exception that is not a subclass of the listed exceptions
+                    if isinstance(ex, KeyboardInterrupt) or not any((issubclass(type(ex), t) for t in exceptions)):
+                        # raise exception
+                        result = ex
+                        break
 
+                    # log the exception
                     LOG.exception(ex)
 
                     if attempts <= retries:
@@ -105,12 +111,20 @@ def retry(func=None, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
                         sleep += backoff
                         continue
                     else:
-                        error = ex
+                        # raise exception
+                        result = ex
                         break
+
                 else:
-                    raise Return(result)
-            if error is not None:
-                raise ex
+                    # no error
+                    result = Return(ret)
+
+            # raise result
+            if result is not None:
+                raise result
+            else:
+                return
+
         return coroutine(_wrapped)
 
     if func is not None:
