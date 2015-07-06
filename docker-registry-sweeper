@@ -40,6 +40,8 @@ import urlparse
 import collections
 import re
 import yaml
+import fcntl
+import contextlib
 import docopt
 import dateutil.parser
 
@@ -638,7 +640,19 @@ class S3RegistryDriver(RegistryDriver):
 
     @coroutine
     def get_repository_index(self, repository):
+        # get index url
         url = self._get_url("{}/repositories/library/{}/_index_images".format(self.path, repository))
+
+        # check if index exists
+        try:
+            yield self._client.fetch(url, method='HEAD', retries=0)
+        except tornado.httpclient.HTTPError as e:
+            if e.code == 404:
+                return
+            else:
+                raise e
+
+        # fetch index
         response = yield self._client.fetch(url)
         raise Return(tornado.escape.json_decode(response.body))
 
@@ -850,13 +864,16 @@ class Registry(object):
 
                 # fetch repository index
                 index = yield self.driver.get_repository_index(repository)
-                for i in index:
-                    try:
-                        # mark indexed image
-                        self.graph.node[i['id']]['repos'].append(repository)
-                    except KeyError:
-                        LOG.error("Indexed image not found in graph: %s (%s)", i['id'], repository)
-                        continue
+                if index is None:
+                    LOG.warn("Repository %s index not found", repository)
+                else:
+                    for i in index:
+                        try:
+                            # mark indexed image
+                            self.graph.node[i['id']]['repos'].append(repository)
+                        except KeyError:
+                            LOG.error("Indexed image not found in graph: %s (%s)", i['id'], repository)
+                            continue
 
                 # fetch repository tags
                 tags = yield self.driver.get_repository_tags(repository)
@@ -1161,16 +1178,48 @@ def load_driver():
     return driver
 
 
+@contextlib.contextmanager
+def pidfile(path=None):
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'docker-registry-sweeper.pid')
+
+    # write pidfile
+    pidfile = open(path, "a+")
+    try:
+        # acquire file lock
+        fcntl.flock(pidfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        raise SystemExit("Already running according to " + path)
+
+    # write pid
+    pidfile.seek(0)
+    pidfile.truncate()
+    pidfile.write(str(os.getpid()))
+    pidfile.flush()
+    pidfile.seek(0)
+    LOG.debug("Wrote: %s", path)
+
+    try:
+
+        # return pidfile
+        yield pidfile
+
+    finally:
+
+        # close pidfile
+        try:
+            pidfile.close()
+        except IOError as err:
+            # ok if file was just closed elsewhere
+            if err.errno != 9:
+                raise
+
+        # cleanup pidfile
+        os.remove(path)
+        LOG.debug("Deleted: %s", path)
+
 @coroutine
 def main():
-    # parse arguments
-    arguments = docopt.docopt(__doc__, version='0.1.0')
-
-    # initialize config
-    init_config(arguments['--config'])
-
-    # initialize log
-    init_log(CONFIG['logging'], logging.DEBUG if arguments['--verbose'] else logging.INFO)
 
     # initialize Driver
     driver = load_driver()
@@ -1212,4 +1261,18 @@ def main():
 
 
 if __name__ == "__main__":
-    tornado.ioloop.IOLoop().current().run_sync(main)
+
+    # parse arguments
+    arguments = docopt.docopt(__doc__, version='0.1.0')
+
+    # initialize config
+    init_config(arguments['--config'])
+
+    # initialize log
+    init_log(CONFIG['logging'], logging.DEBUG if arguments['--verbose'] else logging.INFO)
+
+    # write pid file
+    with pidfile():
+
+        # start ioloop
+        tornado.ioloop.IOLoop().current().run_sync(main)
