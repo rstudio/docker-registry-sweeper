@@ -2,6 +2,7 @@ registry:
   driver: s3
   access_key: ACCESS-KEY-ID
   secret_key: SECRET-KEY
+  region: us-east-1
   bucket: my-bucket
   path: production
 
