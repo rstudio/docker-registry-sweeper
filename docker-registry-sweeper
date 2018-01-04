@@ -1172,7 +1172,8 @@ def load_driver():
         driver = S3RegistryDriver(CONFIG['registry']['bucket'],
                                   CONFIG['registry']['path'],
                                   S3Connection(CONFIG['registry']['access_key'],
-                                               CONFIG['registry']['secret_key']))
+                                               CONFIG['registry']['secret_key'],
+                                               CONFIG['registry'].get('region')))
     else:
         raise ValueError("Unsupported registry driver: %s" % CONFIG['registry']['driver'])
     return driver
@@ -1217,6 +1218,7 @@ def pidfile(path=None):
         # cleanup pidfile
         os.remove(path)
         LOG.debug("Deleted: %s", path)
+
 
 @coroutine
 def main():
