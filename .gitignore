@@ -37,3 +37,8 @@ nosetests.xml
 
 # PyCharm
 .idea/
+
+conf/docker-registry-sweeper.conf
+graph.json
+delete.json
+docker-registry-sweeper.pid

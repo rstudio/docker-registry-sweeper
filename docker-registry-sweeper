@@ -28,40 +28,30 @@ Options (sweep mode):
 Options (history mode):
   -u --unmarked             Show only unmarked images
 """
+import collections
+import contextlib
+import fcntl
 import functools
-import hashlib
-import hmac
 import json
 import logging
 import logging.config
 import os
-import urllib
-import urlparse
-import collections
 import re
-import yaml
-import fcntl
-import contextlib
-import docopt
-import dateutil.parser
-
 from datetime import datetime, timedelta
-from xml.etree import cElementTree as etree
 
+import boto3
+import dateutil.parser
+import docopt
 import networkx
 import networkx.algorithms
 import networkx.readwrite.gpickle
 import networkx.readwrite.json_graph
-import toro
-import tornado.options
-import tornado.ioloop
-import tornado.log
-import tornado.escape
-import tornado.httpclient
-import tornado.httputil
-
-from tornado.gen import coroutine, Return
-
+import yaml
+from tornado import escape
+from tornado import gen
+from tornado import ioloop
+from tornado import locks
+from tornado import queues
 
 CONFIG = None
 
@@ -110,7 +100,7 @@ def retry(func=None, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
 
                     if attempts <= retries:
                         LOG.warn("Retrying... (%d)", attempts)
-                        yield tornado.gen.sleep(sleep)
+                        yield gen.sleep(sleep)
                         sleep += backoff
                         continue
                     else:
@@ -120,7 +110,7 @@ def retry(func=None, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
 
                 else:
                     # no error
-                    result = Return(ret)
+                    result = gen.Return(ret)
                     break
 
             # raise result
@@ -129,7 +119,7 @@ def retry(func=None, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
             else:
                 return
 
-        return coroutine(_wrapped)
+        return gen.coroutine(_wrapped)
 
     if func is not None:
         # Used like:
@@ -194,361 +184,94 @@ def parse_timedelta(v):
         return timedelta(seconds=int(v))
 
 
-class S3Error(Exception):
-    pass
-
-
-class S3Connection(object):
-    def __init__(self, access_key, secret_key, region='us-east-1'):
-        self.access_key = access_key
-        self.secret_key = secret_key
-        self.region = region
-
-
-class S3ListBucketResult(object):
-    def __init__(self):
-        self.name = None
-        self.prefix = None
-        self.marker = None
-        self.max_keys = None
-        self.truncated = None
-        self.prefixes = []
-        self.contents = {}
-        self.next_marker = None
-
-    @classmethod
-    def parse(cls, source):
-
-        result = cls()
-
-        path = []
-        current_parent = None
-        current_key = None
-        current_item = None
-
-        for event, element in etree.iterparse(source, events=("start", "end")):
-
-            # remove namespace from tag (WTF!!?!)
-            tag = element.tag.split('}', 1)[1]
-
-            if event == 'start':
-
-                # get element parent
-                if len(path) > 0:
-                    current_parent = path[-1]
-                else:
-                    current_parent = None
-                path.append(tag)
-
-                if tag == 'Contents':
-                    current_item = dict()
-
-            elif event == 'end':
-
-                if current_parent == 'ListBucketResult':
-                    if tag == 'Name':
-                        result.name = element.text
-                    elif tag == 'Prefix':
-                        result.prefix = element.text
-                    elif tag == 'IsTruncated':
-                        result.truncated = element.text.lower() == 'true'
-                    elif tag == 'NextMarker':
-                        result.next_marker = element.text
-
-                elif current_parent == 'Contents':
-
-                    if tag == 'Key':
-                        current_key = element.text
-                    elif tag == 'Size':
-                        current_item['size'] = int(element.text)
-                    elif tag == 'Etag':
-                        current_item['etag'] = element.text
-                    elif tag == 'Contents':
-                        result.contents[current_key] = current_item
-
-                elif current_parent == 'CommonPrefixes':
-
-                    if tag == 'Prefix':
-                        result.prefixes.append(element.text)
-
-                path.pop()
-
-        return result
-
-
-class S3Client(object):
-    def __init__(self, connection, io_loop=None):
-        """
-        Create new instance of the S3Client class
-        :param connection:
-        :return: None
-        """
-        self._conn = connection
-        self._io_loop = io_loop or tornado.ioloop.IOLoop.current()
-
-        # initialise AsyncHTTPClient
-        tornado.httpclient.AsyncHTTPClient.configure('tornado.curl_httpclient.CurlAsyncHTTPClient', max_clients=100)
-        self._http = tornado.httpclient.AsyncHTTPClient(io_loop=io_loop)
-
-    def _get_authorization(self, url, method, date, headers, payload_hash):
-
-        # gather signed headers
-        signed_headers = self._get_signed_headers(sorted(headers.items()))
-
-        # get canonical date
-        canonical_date = self._get_canonical_date(date)
-
-        # get canonical request
-        canonical_request = self._get_canonical_request(url,
-                                                        method,
-                                                        headers,
-                                                        signed_headers,
-                                                        payload_hash)
-
-        # sign request
-        signature_algorithm = 'AWS4-HMAC-SHA256'
-        signature_scope = self._get_signature_scope(date)
-        signature = self._get_signature(signature_algorithm,
-                                        signature_scope,
-                                        canonical_date,
-                                        canonical_request)
-
-        # get credentials
-        credential = self._conn.access_key + "/" + signature_scope
-
-        return "{} Credential={},SignedHeaders={},Signature={}".format(signature_algorithm,
-                                                                       credential,
-                                                                       signed_headers,
-                                                                       signature)
-
-    def _get_signature(self, signature_algorithm, signature_scope, canonical_date, canonical_request):
-
-        # hash canonical request
-        signature_request = self._calculate_hash(canonical_request)
-
-        # get string to sign
-        string_to_sign = "\n".join([
-            signature_algorithm,
-            canonical_date,
-            signature_scope,
-            signature_request
-        ])
-
-        # sign string
-        return self._calculate_hmac(self._get_signing_key(signature_scope), string_to_sign)
-
-    def _get_signing_key(self, scope):
-        parts = scope.split('/')
-        key = "AWS4" + self._conn.secret_key
-        h = self._calculate_hmac(key, parts[0], False)
-        h = self._calculate_hmac(h, parts[1], False)
-        h = self._calculate_hmac(h, parts[2], False)
-        h = self._calculate_hmac(h, parts[3], False)
-        return h
-
-    def _get_signature_scope(self, date):
-        return "/".join((date.strftime("%Y%m%d"), self._conn.region, "s3", "aws4_request"))
-
-    def _get_canonical_date(self, date):
-        return tornado.httputil.format_timestamp(date)
-
-    def _get_canonical_headers_string(self, headers):
-        return "".join([k.lower() + ":" + v.strip() + "\n" for k, v in headers])
-
-    def _get_canonical_query_string(self, query):
-        def _encode(s):
-            return urllib.quote_plus(s.encode('utf-8'))
-
-        return "&".join([_encode(k) + "=" + _encode(v) for k, v in query])
-
-    def _get_signed_headers(self, headers):
-        return ";".join([k.lower() for k, v in headers])
-
-    def _get_canonical_request(self, url, method, headers, signed_headers, payload_hash):
-
-        url_parts = urlparse.urlparse(url)
-
-        query = urlparse.parse_qsl(url_parts.query, True)
-
-        # get canonical verb
-        request_method = method.upper()
-
-        # get canonical url
-        request_uri = url_parts.path
-
-        # get canonical query string
-        request_query = self._get_canonical_query_string(sorted(query))
-
-        # get canonical headers
-        request_headers = self._get_canonical_headers_string(sorted(headers.items()))
-
-        # get signed headers
-        signed_headers = self._get_signed_headers(sorted(headers.items()))
-
-        return "\n".join((request_method,
-                          request_uri,
-                          request_query,
-                          request_headers,
-                          signed_headers,
-                          payload_hash))
-
-    @staticmethod
-    def _calculate_hmac(key, data, hex=True):
-        h = hmac.new(tornado.escape.utf8(key),
-                     tornado.escape.utf8(data),
-                     digestmod=hashlib.sha256)
-        return h.hexdigest() if hex else h.digest()
-
-    @staticmethod
-    def _calculate_hash(data, hex=True):
-        if data is None:
-            data = ""
-        h = hashlib.sha256(data.encode('utf-8'))
-        return h.hexdigest() if hex else h.digest()
-
-    def fetch(self, url, method='GET', headers=None, payload=None, retries=3):
-        # LOG.debug("%s: %s", method, url)
-
-        # get headers
-        if headers is None:
-            headers = dict()
-
-        # get Date
-        date = datetime.utcnow()
-        headers['Date'] = tornado.httputil.format_timestamp(date)
-
-        # get Host
-        host = urlparse.urlparse(url).netloc
-        headers['Host'] = host
-
-        # get Hash
-        hash = self._calculate_hash(payload)
-        headers['x-amz-content-sha256'] = hash
-
-        # get Authorization
-        headers['Authorization'] = self._get_authorization(url, method, date, headers, hash)
-
-        @coroutine
-        def _fetch():
-            try:
-                response = yield self._http.fetch(url, method=method, headers=headers, body=payload)
-                raise Return(response)
-            except tornado.httpclient.HTTPError as e:
-                self._handle_error(e)
-
-        # optionally retry request if it fails
-        if retries:
-            @retry(retries=retries)
-            def _fetch_with_retry():
-                return _fetch()
-            return _fetch_with_retry()
-        else:
-            return _fetch()
-
-    def _handle_error(self, e):
-        if e.response is not None and e.response.body:
-            if e.response.headers.get('Content-Type') == 'application/xml':
-                try:
-                    # parse xml response
-                    doc = etree.fromstring(e.response.body)
-                    message = doc.find('./Message')
-                    if message is not None:
-                        raise S3Error(message.text)
-                except etree.ParseError:
-                    LOG.exception("Unable to parse response error")
-        raise e
-
-
 class RegistryDriver(object):
     """
     An abstract class for storage drivers
     """
 
-    @coroutine
+    @gen.coroutine
     def fetch_images(self, callback):
         raise NotImplementedError()
 
-    @coroutine
+    @gen.coroutine
     def fetch_repositories(self, callback):
         raise NotImplementedError()
 
-    @coroutine
+    @gen.coroutine
     def get_image_info(self, image):
         raise NotImplementedError()
 
-    @coroutine
+    @gen.coroutine
     def get_image_ancestry(self, image):
         raise NotImplementedError()
 
-    @coroutine
+    @gen.coroutine
     def get_repository_info(self, repository):
         raise NotImplementedError()
 
-    @coroutine
+    @gen.coroutine
     def get_repository_tags(self, repository):
         raise NotImplementedError()
 
-    @coroutine
+    @gen.coroutine
     def get_repository_index(self, repository):
         raise NotImplementedError()
 
-    @coroutine
+    @gen.coroutine
     def delete_repository_tag(self, repository, tag):
         raise NotImplementedError()
 
-    @coroutine
+    @gen.coroutine
     def delete_repository(self, repository):
         raise NotImplementedError()
 
-    @coroutine
+    @gen.coroutine
     def delete_image(self, image):
         raise NotImplementedError()
 
 
 class S3RegistryDriver(RegistryDriver):
-    def __init__(self, bucket, path, connection, secure=True, io_loop=None):
+    def __init__(self, bucket, path, region='us-east-1', access_key=None, secret_key=None, secure=True, io_loop=None):
         """
         Create a new instance of the S3RegistryDriver class
-        :param path:
-        :param bucket:
-        :param connection:
+        :param bucket: Name of bucket
+        :param path: Path prefix within bucket
+        :param region: AWS region of bucket
+        :param access_key: AWS Access Key ID. Falls back to boto3 strategies if None
+        :param secret_key: AWS Secret Key.
         :param secure: If ``True``, use HTTPS, otherwise use HTTP.
         :param io_loop:
         :return:
         """
 
-        self.bucket = bucket
-        self.path = path
-        self.connection = connection
-        self.secure = secure
-        self._io_loop = io_loop or tornado.ioloop.IOLoop.current()
-        self._client = S3Client(self.connection, io_loop=io_loop)
+        self._resource = boto3.resource('s3', region_name=region,
+                                        aws_access_key_id=access_key, aws_secret_access_key=secret_key, use_ssl=secure)
+        self._client = boto3.client('s3', region_name=region,
+                                    aws_access_key_id=access_key, aws_secret_access_key=secret_key, use_ssl=secure)
+        self.bucket = self._resource.Bucket(bucket)
 
-    def _get_endpoint(self):
-        if self.connection.region.lower() == 'us-east-1':
-            return "s3-external-1.amazonaws.com"  # use ec2 address
+        if path:
+            self.path = '%s/' % path
         else:
-            return "s3-" + self.connection.region + ".amazonaws.com"
+            self.path = ''
 
-    def _get_url(self, resource, params=None):
-        scheme = "https" if self.secure else "http"
-        endpoint = self._get_endpoint()
-        url = "{}://{}/{}/{}".format(scheme, endpoint, self.bucket, resource.lstrip("/"))
-        if params is not None:
-            url += '?' + urllib.urlencode(params)
-        return url
+        self.secure = secure
+        self._io_loop = io_loop or ioloop.IOLoop.current()
 
-    @coroutine
-    def _list_bucket(self, prefix='', delimiter='', marker=None, max_keys=1000):
-        # fetch response
-        response = yield self._client.fetch(self._get_url("/", dict(prefix=prefix,
-                                                                    delimiter=delimiter,
-                                                                    marker=marker or '',
-                                                                    max_keys=max_keys)))
-        # parse response
-        raise Return(S3ListBucketResult.parse(response.buffer))
+    def _list_bucket(self, prefix='', delimiter=''):
+        """
+        List the objects in a bucket for a given prefix
+        :param prefix:
+        :param delimiter:
+        :return: an iterator of pages of results
+        """
+        paginator = self._client.get_paginator('list_objects_v2')
+        return paginator.paginate(Bucket=self.bucket.name,
+                                  Delimiter=delimiter,
+                                  Prefix=prefix,
+                                  PaginationConfig={'PageSize': 1000})
 
-    @coroutine
+    @gen.coroutine
     def fetch_images(self, callback):
         """
         Fetch images from the registry and invoke callback for each
@@ -556,36 +279,29 @@ class S3RegistryDriver(RegistryDriver):
         :return:
         """
         images = set()
-        prefix = "{}/images/".format(self.path)
-        marker = None
-        while True:
+        prefix = "{}images/".format(self.path)
 
-            # list bucket
-            result = yield self._list_bucket(prefix=prefix, delimiter='/', marker=marker)
+        # list bucket
+        pages = self._list_bucket(prefix=prefix, delimiter='/')
 
-            # iterate prefixes to get image ids
-            for p in result.prefixes:
-                if p != prefix:
+        # iterate common prefixes to get image ids
+        for page in pages:
+            for cp in page['CommonPrefixes']:
+                if cp['Prefix'] != prefix:
 
                     # extract image id
-                    image = p[len(prefix):-1]
+                    image = cp['Prefix'][len(prefix):-1]
 
                     # since we're listing the bucket, duplicate prefixes may be returned
                     if image not in images:
                         images.add(image)
 
                         # fire callback
-                        self._io_loop.add_callback(callback, image)
-
-            if not result.truncated:
-                break
-
-            # continue iterating
-            marker = result.next_marker
+                        yield callback(image)
 
         LOG.debug("Found: %d images", len(images))
 
-    @coroutine
+    @gen.coroutine
     def fetch_repositories(self, callback):
         """
         Fetch repositories from registry and invoke callback for each
@@ -593,70 +309,51 @@ class S3RegistryDriver(RegistryDriver):
         :return:
         """
         repositories = set()
-        prefix = "{}/repositories/library/".format(self.path)
-        marker = None
-        while True:
+        prefix = "{}repositories/library/".format(self.path)
 
-            # list bucket
-            result = yield self._list_bucket(prefix=prefix, delimiter='/', marker=marker)
+        # list bucket
+        pages = self._list_bucket(prefix=prefix, delimiter='/')
 
-            # iterate prefixes to get image ids
-            for p in result.prefixes:
-                if p != prefix:
+        # iterate common prefixes to get repositories
+        for page in pages:
+            for cp in page['CommonPrefixes']:
+                if cp['Prefix'] != prefix:
 
                     # extract repo name
-                    repo = p[len(prefix):-1]
+                    repo = cp['Prefix'][len(prefix):-1]
 
                     # since we're listing the bucket, duplicate prefixes may be returned
                     if repo not in repositories:
                         repositories.add(repo)
 
                         # fire callback
-                        self._io_loop.add_callback(callback, repo)
-
-            if not result.truncated:
-                break
-
-            # continue iterating
-            marker = result.next_marker
+                        yield callback(repo)
 
         LOG.debug("Found: %d repositories", len(repositories))
 
-    @coroutine
+    @gen.coroutine
     def get_image_info(self, image):
-        response = yield self._client.fetch(self._get_url("{}/images/{}/json".format(self.path, image)))
-        raise Return(tornado.escape.json_decode(response.body))
+        response = self.bucket.Object("{}images/{}/json".format(self.path, image)).get()
+        raise gen.Return(escape.json_decode(response['Body'].read()))
 
-    @coroutine
+    @gen.coroutine
     def get_image_ancestry(self, image):
-        response = yield self._client.fetch(self._get_url("{}/images/{}/ancestry".format(self.path, image)))
-        raise Return(tornado.escape.json_decode(response.body))
+        response = self.bucket.Object("{}images/{}/ancestry".format(self.path, image)).get()
+        raise gen.Return(escape.json_decode(response['Body'].read()))
 
-    @coroutine
+    @gen.coroutine
     def get_repository_info(self, repository):
-        url = self._get_url("{}/repositories/library/{}/json".format(self.path, repository))
-        response = yield self._client.fetch(url)
-        raise Return(tornado.escape.json_decode(response.body))
+        response = self.bucket.Object("{}repositories/library/{}/json".format(self.path, repository)).get()
+        raise gen.Return(escape.json_decode(response['Body'].read()))
 
-    @coroutine
+    @gen.coroutine
     def get_repository_index(self, repository):
         # get index url
-        url = self._get_url("{}/repositories/library/{}/_index_images".format(self.path, repository))
+        response = self.bucket.Object("{}repositories/library/{}/_index_images".format(self.path, repository)).get()
 
-        # check if index exists
-        try:
-            yield self._client.fetch(url, method='HEAD', retries=0)
-        except tornado.httpclient.HTTPError as e:
-            if e.code == 404:
-                return
-            else:
-                raise e
+        raise gen.Return(escape.json_decode(response['Body'].read()))
 
-        # fetch index
-        response = yield self._client.fetch(url)
-        raise Return(tornado.escape.json_decode(response.body))
-
-    @coroutine
+    @gen.coroutine
     def get_repository_tags(self, repository):
         """
         Return a dict of tags for the given repository
@@ -664,53 +361,40 @@ class S3RegistryDriver(RegistryDriver):
         :return:
         """
         tags = {}
-        prefix = "{}/repositories/library/{}/tag_".format(self.path, repository)
-        result = yield self._list_bucket(prefix=prefix, delimiter='/')
+        prefix = "{}repositories/library/{}/tag_".format(self.path, repository)
+        pages = self._list_bucket(prefix=prefix)
 
-        # iterate keys to get contents
-        for key in result.contents:
-            # extract tag
-            tag = key.split('/')[-1].split('_')[-1]
+        for page in pages:
+            for content in page.get('Contents', []):
+                # extract tag
+                tag = content['Key'].split('/')[-1].split('_')[-1]
 
-            # fetch image
-            response = yield self._client.fetch(self._get_url(key))
-            image = response.body.decode('utf-8').replace('\"', '')
+                # fetch image
+                response = self.bucket.Object(content['Key']).get()
+                image = response['Body'].read().decode('utf-8').replace('\"', '')
 
-            tags[tag] = image
+                tags[tag] = image
 
-        raise Return(tags)
+        raise gen.Return(tags)
 
-    @coroutine
+    @gen.coroutine
     def delete_repository_tag(self, repository, tag):
         pass
 
-    @coroutine
+    @gen.coroutine
     def delete_repository(self, repository):
         pass
 
-    @coroutine
+    @gen.coroutine
     def delete_image(self, image):
 
         # delete only these keys
         keys = ['_files', '_checksum', 'ancestry', 'json', 'layer']
 
         for k in keys:
-            url = self._get_url("{}/images/{}/{}".format(self.path, image, k))
-
-            # check if key exists
-            try:
-                yield self._client.fetch(url, method='HEAD', retries=0)
-            except tornado.httpclient.HTTPError as e:
-                if e.code == 404:
-                    continue
-                else:
-                    raise e
-
-            # delete the key
-            yield self._client.fetch(url, method='DELETE')
+            self.bucket.Object("{}images/{}/{}".format(self.path, image, k)).delete()
 
             LOG.debug("Deleted: %s/%s", image, k)
-
 
 
 class Registry(object):
@@ -756,7 +440,7 @@ class Registry(object):
         LOG.debug("Loading graph from: %s", path)
         self.graph = self._read_graph(path, format)
 
-    @coroutine
+    @gen.coroutine
     def scan(self, save=None, save_format='json'):
         """
         Construct the registry graph by scanning
@@ -783,15 +467,15 @@ class Registry(object):
 
         LOG.info("Scan completed in %d seconds", (datetime.utcnow() - start_time).total_seconds())
 
-    @coroutine
+    @gen.coroutine
     def _scan_images(self, concurrency=25):
 
         # initialize Queue
-        queue = toro.JoinableQueue()
-        semaphore = toro.BoundedSemaphore(concurrency)
+        queue = queues.Queue()
+        semaphore = locks.BoundedSemaphore(concurrency)
         counters = collections.defaultdict(int)
 
-        @coroutine
+        @gen.coroutine
         def _process_image():
 
             # get an image from the queue
@@ -818,13 +502,13 @@ class Registry(object):
                 LOG.exception("Error processing image: %s", image)
 
                 # put item back in the queue
-                queue.put(image)
+                yield queue.put(image)
 
             finally:
                 queue.task_done()
                 semaphore.release()
 
-        @coroutine
+        @gen.coroutine
         def _process_image_queue():
 
             # process forever
@@ -846,15 +530,15 @@ class Registry(object):
         # wait for queue to be empty
         yield queue.join()
 
-    @coroutine
+    @gen.coroutine
     def _scan_repositories(self, concurrency=25):
 
         # initialize Queue
-        queue = toro.JoinableQueue()
-        semaphore = toro.BoundedSemaphore(concurrency)
+        queue = queues.Queue()
+        semaphore = locks.BoundedSemaphore(concurrency)
         counters = collections.defaultdict(int)
 
-        @coroutine
+        @gen.coroutine
         def _process_repository():
 
             # get a repo from the queue
@@ -928,7 +612,7 @@ class Registry(object):
                 queue.task_done()
                 semaphore.release()
 
-        @coroutine
+        @gen.coroutine
         def _process_repository_queue():
 
             # process forever
@@ -950,7 +634,7 @@ class Registry(object):
         # wait for queue to be empty
         yield queue.join()
 
-    @coroutine
+    @gen.coroutine
     def image_history(self, image, filter_marked=False):
 
         LOG.debug("Getting image history: %s", image)
@@ -988,9 +672,9 @@ class Registry(object):
                                                    marked=image_marked,
                                                    created=to_iso8601(image_date)))
 
-        raise Return(history)
+        raise gen.Return(history)
 
-    @coroutine
+    @gen.coroutine
     def repository_history(self, repository, filter_marked=False):
 
         LOG.debug("Getting repository history: %s", repository)
@@ -1013,7 +697,7 @@ class Registry(object):
             for i in networkx.algorithms.descendants(repositories, repository):
                 history[i] = yield self.image_history(i, filter_marked)
 
-        raise Return(history)
+        raise gen.Return(history)
 
     def _read_sweep_file(self, path='delete.json'):
         # read sweep file
@@ -1029,7 +713,7 @@ class Registry(object):
         with open(path, 'wb') as f:
             json.dump({image: to_iso8601(date) for image, date in data.iteritems()}, f, encoding='utf-8')
 
-    @coroutine
+    @gen.coroutine
     def _delete_image(self, image, dry_run):
         assert len(self.graph.predecessors(image)) == 0
 
@@ -1042,7 +726,7 @@ class Registry(object):
         # remove the node from the graph
         self.graph.remove_node(image)
 
-    @coroutine
+    @gen.coroutine
     def _prune_repository(self, repo, images, prune, dry_run):
 
         # gather a set of images to keep
@@ -1052,7 +736,7 @@ class Registry(object):
 
         # TODO: prune the repository
 
-    @coroutine
+    @gen.coroutine
     def sweep(self, age, prune=False, blacklist=None, dry_run=True):
         """
         Sweep the graph for unreferenced images
@@ -1171,9 +855,9 @@ def load_driver():
     if CONFIG['registry']['driver'] == 's3':
         driver = S3RegistryDriver(CONFIG['registry']['bucket'],
                                   CONFIG['registry']['path'],
-                                  S3Connection(CONFIG['registry']['access_key'],
-                                               CONFIG['registry']['secret_key'],
-                                               CONFIG['registry'].get('region')))
+                                  CONFIG['registry'].get('region'),
+                                  CONFIG['registry'].get('access_key'),
+                                  CONFIG['registry'].get('secret_key'))
     else:
         raise ValueError("Unsupported registry driver: %s" % CONFIG['registry']['driver'])
     return driver
@@ -1220,7 +904,7 @@ def pidfile(path=None):
         LOG.debug("Deleted: %s", path)
 
 
-@coroutine
+@gen.coroutine
 def main():
 
     # initialize Driver
@@ -1277,4 +961,4 @@ if __name__ == "__main__":
     with pidfile():
 
         # start ioloop
-        tornado.ioloop.IOLoop().current().run_sync(main)
+        ioloop.IOLoop().current().run_sync(main)

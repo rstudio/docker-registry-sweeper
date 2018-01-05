@@ -1,5 +1,6 @@
 PyYAML==3.11
 backports.ssl-match-hostname==3.4.0.2
+boto3==1.5.7
 certifi==14.05.14
 dateutils==0.6.6
 decorator==3.4.2
@@ -10,6 +11,5 @@ pyparsing==2.0.3
 python-dateutil==2.4.1
 pytz==2015.2
 six==1.9.0
-tornado==4.1
-toro==0.8
+tornado==4.5.2
 wsgiref==0.1.2
